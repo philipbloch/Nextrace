@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" role="img" aria-labelledby="title desc">
+  <title id="title">Nextrace logo</title>
+  <desc id="desc">A modern traced N built from an execution path and workflow nodes.</desc>
+  <defs>
+    <linearGradient id="nextrace-bg" x1="12" y1="8" x2="70" y2="72" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#15171d" />
+      <stop offset="0.52" stop-color="#0b2630" />
+      <stop offset="1" stop-color="#050507" />
+    </linearGradient>
+    <linearGradient id="nextrace-line" x1="18" y1="22" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#54d1f3" />
+      <stop offset="1" stop-color="#f553a8" />
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="64" height="64" rx="18" fill="url(#nextrace-bg)" />
+  <rect x="8.75" y="8.75" width="62.5" height="62.5" rx="17.25" fill="none" stroke="#f6f7f2" stroke-opacity="0.14" stroke-width="1.5" />
+  <path d="M22 58V22l36 36V22" fill="none" stroke="url(#nextrace-line)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" />
+  <circle cx="22" cy="58" r="5" fill="#54d1f3" />
+  <circle cx="22" cy="22" r="5" fill="#ffffff" />
+  <circle cx="58" cy="58" r="5" fill="#f553a8" />
+  <rect x="52" y="16" width="12" height="12" rx="4" fill="#54d1f3" />
+</svg>

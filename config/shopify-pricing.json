@@ -1,0 +1,27 @@
+{
+  "prices": [
+    {
+      "provider": "shopify-proxy",
+      "model": "gpt-5.6-sol",
+      "input_per_million": 3.532705646,
+      "cached_input_per_million": 0.353270565,
+      "cache_write_5m_per_million": 4.415882058,
+      "output_per_million": 21.196233878
+    },
+    {
+      "provider": "shopify-proxy",
+      "model": "gpt-5.6-luna",
+      "input_per_million": 0.706541129,
+      "cached_input_per_million": 0.070654113,
+      "cache_write_5m_per_million": 0.883176412,
+      "output_per_million": 4.239246776
+    },
+    {
+      "provider": "shopify-proxy",
+      "model": "gpt-5.5",
+      "input_per_million": 4.337280743,
+      "cached_input_per_million": 0.433728074,
+      "output_per_million": 26.023684459
+    }
+  ]
+}
