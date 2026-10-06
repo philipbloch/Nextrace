@@ -14,7 +14,6 @@ def test_summary_metrics(tmp_path):
             response="r",
             input_tokens=100,
             output_tokens=50,
-            cost_usd=0.05,
             latency_ms=200,
         )
         trace.tool_call(name="search", arguments={}, result={}, success=True, accuracy=0.8)
@@ -27,24 +26,18 @@ def test_summary_metrics(tmp_path):
             response="r",
             input_tokens=50,
             output_tokens=20,
-            cost_usd=0,
             latency_ms=900,
         )
 
     summary = store.summary()
     assert summary["totals"]["traces"] == 2
     assert summary["totals"]["applications"] == 2
-    assert summary["cost_totals"]["estimated_cost_usd"] == 0.05
-    assert summary["cost_totals"]["shopify_proxy_cost_usd"] == 0.05
-    assert summary["cost_by_application"][0]["application"] == "app-a"
-    assert summary["shopify_cost_by_application"] == [{"application": "app-a", "cost_usd": 0.05}]
     assert summary["tool_call_accuracy"][0]["name"] == "search"
     assert summary["prompt_model_comparisons"][0]["calls"] == 1
 
     filtered = store.summary(application="app-a")
     assert filtered["totals"]["traces"] == 1
     assert filtered["totals"]["applications"] == 1
-    assert filtered["cost_by_application"] == [{"application": "app-a", "cost_usd": 0.05}]
     assert filtered["failure_rates"][0]["application"] == "app-a"
     assert filtered["slowest_steps"][0]["model"] == "gpt-test"
     assert filtered["tool_call_accuracy"][0]["name"] == "search"
@@ -53,7 +46,6 @@ def test_summary_metrics(tmp_path):
     assert model_summary["provider"] == "shopify-proxy"
     assert model_summary["model"] == "gpt-test"
     assert model_summary["calls"] == 1
-    assert model_summary["cost_usd"] == 0.05
     assert model_summary["avg_tokens"] == 150.0
 
 
@@ -80,24 +72,27 @@ def test_summary_filters_by_date_range(tmp_path):
     store = SQLiteStore(tmp_path / "summary.db")
 
     with ai_trace("old-app", store=store) as trace:
-        trace.model_call(provider="openai", model="old", prompt="p", response="r", cost_usd=0.25)
+        trace.model_call(provider="openai", model="old", prompt="p", response="r")
         old_id = trace.trace_id
 
     with ai_trace("new-app", store=store) as trace:
-        trace.model_call(provider="openai", model="new", prompt="p", response="r", cost_usd=0.75)
+        trace.model_call(provider="openai", model="new", prompt="p", response="r")
         new_id = trace.trace_id
 
     with store._connect() as conn:
         conn.execute("UPDATE traces SET started_at = 1000 WHERE id = ?", (old_id,))
-        conn.execute("UPDATE spans SET started_at = 1000, ended_at = 1001 WHERE trace_id = ?", (old_id,))
+        conn.execute(
+            "UPDATE spans SET started_at = 1000, ended_at = 1001 WHERE trace_id = ?", (old_id,)
+        )
         conn.execute("UPDATE traces SET started_at = 2000 WHERE id = ?", (new_id,))
-        conn.execute("UPDATE spans SET started_at = 2000, ended_at = 2001 WHERE trace_id = ?", (new_id,))
+        conn.execute(
+            "UPDATE spans SET started_at = 2000, ended_at = 2001 WHERE trace_id = ?", (new_id,)
+        )
 
     summary = store.summary(since=1500, until=2500)
 
     assert summary["totals"]["traces"] == 1
     assert summary["totals"]["applications"] == 1
-    assert summary["cost_by_application"] == [{"application": "new-app", "cost_usd": 0.75}]
     assert summary["prompt_model_comparisons"][0]["model"] == "new"
 
 

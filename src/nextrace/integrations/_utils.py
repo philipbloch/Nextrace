@@ -1,12 +1,14 @@
-"""Integration helper functions."""
-
 from __future__ import annotations
 
 import re
-import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from nextrace.context import current_trace
+from nextrace.core import Span, Trace
 
 SENSITIVE_KEYS = {
     "access_token",
@@ -48,7 +50,6 @@ SENSITIVE_SUFFIXES = (
 
 
 def safe_serialize(value: Any) -> Any:
-    """Convert provider and client objects into JSON-friendly structures."""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
@@ -57,16 +58,13 @@ def safe_serialize(value: Any) -> Any:
         return {str(key): safe_serialize(val) for key, val in value.items()}
     if is_dataclass(value):
         return safe_serialize(asdict(value))
-    if hasattr(value, "model_dump"):
-        try:
-            return safe_serialize(value.model_dump())
-        except Exception:
-            pass
-    if hasattr(value, "to_dict"):
-        try:
-            return safe_serialize(value.to_dict())
-        except Exception:
-            pass
+    for method in ("model_dump", "to_dict"):
+        serialize = getattr(value, method, None)
+        if callable(serialize):
+            try:
+                return safe_serialize(serialize())
+            except Exception:
+                continue
     if hasattr(value, "__dict__"):
         public = {
             key: val
@@ -91,7 +89,6 @@ def get_nested(value: Any, *path: str) -> Any:
 
 
 def normalize_usage(usage: Any) -> dict[str, int | None]:
-    """Normalize OpenAI, Anthropic, Gemini, and custom usage objects."""
     if usage is None:
         return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
 
@@ -121,49 +118,46 @@ def normalize_usage(usage: Any) -> dict[str, int | None]:
 
 
 def compact_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Keep metadata useful without storing obvious secret-bearing values."""
     return _remove_sensitive_values(safe_serialize(kwargs))
 
 
-def record_model_span(
-    trace: Any,
+@contextmanager
+def model_span(
     *,
     provider: str,
     model: str,
     name: str,
     prompt: Any,
-    response: Any,
-    started_at: float,
-    usage: Any = None,
+    trace: Trace | None = None,
     kwargs: dict[str, Any] | None = None,
-    response_id: Any = None,
-    error: BaseException | None = None,
-) -> None:
-    """Record the common span shape emitted by provider client integrations."""
-    normalized_usage = normalize_usage(usage)
-    metadata = {"kwargs": compact_kwargs(kwargs or {})}
-    if response_id is not None:
-        metadata["id"] = response_id
-    trace.model_call(
+) -> Iterator[Span]:
+    active = trace or current_trace(required=True)
+    with active.step(
+        "model",
+        name,
         provider=provider,
         model=model,
-        name=name,
         prompt=prompt,
-        response=safe_serialize(response),
-        latency_ms=(time.perf_counter() - started_at) * 1000,
-        input_tokens=normalized_usage["input_tokens"],
-        output_tokens=normalized_usage["output_tokens"],
-        total_tokens=normalized_usage["total_tokens"],
-        metadata=metadata,
-        error=error,
-    )
+        metadata={"kwargs": compact_kwargs(kwargs or {})},
+    ) as span:
+        yield span
+
+
+def set_model_result(
+    span: Span, response: Any, *, usage: Any = None, response_id: Any = None
+) -> None:
+    span.set_result(response=safe_serialize(response), **normalize_usage(usage))
+    if response_id is not None:
+        span.metadata["id"] = response_id
 
 
 def redact_url(url: str) -> str:
-    """Preserve URL routing information while redacting query values."""
     parsed = urlsplit(url)
-    query = urlencode([(key, "[REDACTED]") for key, _ in parse_qsl(parsed.query, keep_blank_values=True)])
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+    query = urlencode(
+        [(key, "[REDACTED]") for key, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    )
+    host = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, host, parsed.path, query, parsed.fragment))
 
 
 def _first_not_none(*values: Any) -> Any:
@@ -183,5 +177,5 @@ def _remove_sensitive_values(value: Any) -> Any:
 
 
 def is_sensitive_key(key: str) -> bool:
-    normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", key.strip()).lower().replace("-", "_")
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key.strip()).lower().replace("-", "_")
     return normalized in SENSITIVE_KEYS or normalized.endswith(SENSITIVE_SUFFIXES)

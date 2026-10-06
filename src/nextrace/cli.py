@@ -1,67 +1,81 @@
-"""Command line entry points."""
-
 from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from nextrace.context import default_db_path
+from nextrace.mcp_proxy import run_http_proxy, run_stdio_proxy
 
 
 def _build_parser(prog: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=prog)
-    subparsers = parser.add_subparsers(dest="command")
+    subparsers = parser.add_subparsers(dest="command_name")
+    database_options = argparse.ArgumentParser(add_help=False)
+    database_options.add_argument(
+        "--db",
+        dest="db_path",
+        default=str(default_db_path()),
+        help="SQLite trace database path",
+    )
 
-    dashboard = subparsers.add_parser("dashboard", help="Run the local dashboard")
-    dashboard.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
+    dashboard = subparsers.add_parser(
+        "dashboard", parents=[database_options], help="Run the local dashboard"
+    )
     dashboard.add_argument("--host", default="127.0.0.1", help="Host to bind")
     dashboard.add_argument("--port", default=8765, type=int, help="Port to bind")
     dashboard.add_argument("--reload", action="store_true", help="Enable uvicorn reload")
 
-    mcp_proxy = subparsers.add_parser("mcp-proxy", help="Proxy a stdio MCP server and record redacted traces")
-    mcp_proxy.add_argument(
+    mcp_options = argparse.ArgumentParser(add_help=False)
+    mcp_options.add_argument(
         "--application",
         default="auto",
         help="Application name to record, or 'auto' to use the active project",
     )
-    mcp_proxy.add_argument("--server", required=True, help="MCP server name to record")
-    mcp_proxy.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
-    mcp_proxy.add_argument("--session-id", default=None, help="Optional session id to attach to traces")
-    mcp_proxy.add_argument("child_command", nargs=argparse.REMAINDER, help="Command to run after --")
+    mcp_options.add_argument("--server", required=True, help="MCP server name to record")
+    mcp_options.add_argument(
+        "--session-id", default=None, help="Optional session id to attach to traces"
+    )
+    mcp_proxy = subparsers.add_parser(
+        "mcp-proxy",
+        parents=[database_options, mcp_options],
+        help="Proxy a stdio MCP server and record redacted traces",
+    )
+    mcp_proxy.add_argument("command", nargs=argparse.REMAINDER, help="Command to run after --")
 
     http_proxy = subparsers.add_parser(
         "mcp-http-proxy",
+        parents=[database_options, mcp_options],
         help="Proxy an HTTP MCP endpoint and record redacted traces",
     )
     http_proxy.add_argument(
-        "--application",
-        default="auto",
-        help="Application name to record, or 'auto' to use the active project",
+        "--target", dest="target_url", required=True, help="Upstream HTTP MCP endpoint"
     )
-    http_proxy.add_argument("--server", required=True, help="MCP server name to record")
-    http_proxy.add_argument("--target", required=True, help="Upstream HTTP MCP endpoint")
     http_proxy.add_argument("--host", default="127.0.0.1", help="Local host to bind")
     http_proxy.add_argument("--port", default=8766, type=int, help="Local port to bind")
-    http_proxy.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
-    http_proxy.add_argument("--session-id", default=None, help="Optional session id to attach to traces")
-    http_proxy.add_argument("--timeout", default=3600, type=float, help="Upstream socket timeout in seconds")
+    http_proxy.add_argument(
+        "--timeout", default=3600, type=float, help="Upstream socket timeout in seconds"
+    )
 
     codex_import = subparsers.add_parser(
         "codex-import",
+        parents=[database_options],
         help="Import local Codex token usage as redacted model traces",
     )
     codex_import.add_argument("--application", required=True, help="Application name to record")
-    codex_import.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
     codex_import.add_argument("--codex-home", default="~/.codex", help="Codex home directory")
     codex_import.add_argument(
         "--session-id",
+        dest="session_ids",
         action="append",
         default=[],
         help="Codex session id to import. Can be repeated.",
     )
     codex_import.add_argument(
         "--session-file",
+        dest="session_files",
         action="append",
         default=[],
         help="Codex JSONL session file to import. Can be repeated.",
@@ -74,32 +88,16 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     )
     codex_import.add_argument("--provider", default=None, help="Override provider name")
     codex_import.add_argument("--model", default=None, help="Override model name")
-    codex_import.add_argument(
-        "--input-cost-per-million",
-        type=float,
-        default=None,
-        help="Optional input-token price used to estimate cost",
-    )
-    codex_import.add_argument(
-        "--cached-input-cost-per-million",
-        type=float,
-        default=None,
-        help="Optional cached-input-token price used to estimate cost",
-    )
-    codex_import.add_argument(
-        "--output-cost-per-million",
-        type=float,
-        default=None,
-        help="Optional output-token price used to estimate cost",
-    )
 
     claude_import = subparsers.add_parser(
         "claude-import",
+        parents=[database_options],
         help="Import local Claude Code token usage as redacted model traces",
     )
     claude_import.add_argument("--application", required=True, help="Application name to record")
-    claude_import.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
-    claude_import.add_argument("--claude-home", default="~/.claude", help="Claude Code home directory")
+    claude_import.add_argument(
+        "--claude-home", default="~/.claude", help="Claude Code home directory"
+    )
     claude_import.add_argument(
         "--project-path",
         default=".",
@@ -107,6 +105,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     )
     claude_import.add_argument(
         "--session-file",
+        dest="session_files",
         action="append",
         default=[],
         help="Claude Code JSONL transcript file to import. Can be repeated.",
@@ -121,10 +120,10 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
 
     pi_import = subparsers.add_parser(
         "pi-import",
+        parents=[database_options],
         help="Import local Pi token usage as redacted model traces",
     )
     pi_import.add_argument("--application", required=True, help="Application name to record")
-    pi_import.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
     pi_import.add_argument("--pi-home", default="~/.pi/agent", help="Pi agent home directory")
     pi_import.add_argument(
         "--project-path",
@@ -133,6 +132,7 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
     )
     pi_import.add_argument(
         "--session-file",
+        dest="session_files",
         action="append",
         default=[],
         help="Pi JSONL session file to import. Can be repeated.",
@@ -146,11 +146,13 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
 
     local_import = subparsers.add_parser(
         "import-local-usage",
+        parents=[database_options],
         help="Auto-import changed local AI-agent usage grouped by project",
     )
-    local_import.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
     local_import.add_argument("--codex-home", default="~/.codex", help="Codex home directory")
-    local_import.add_argument("--claude-home", default="~/.claude", help="Claude Code home directory")
+    local_import.add_argument(
+        "--claude-home", default="~/.claude", help="Claude Code home directory"
+    )
     local_import.add_argument("--pi-home", default="~/.pi/agent", help="Pi agent home directory")
     local_import.add_argument(
         "--state-path",
@@ -169,25 +171,19 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         help="Ignore importer state and rescan all local usage files",
     )
 
-    reprice = subparsers.add_parser(
-        "reprice",
-        help="Recalculate stored model costs with the configured pricing registry",
+    export = subparsers.add_parser(
+        "export-otel", parents=[database_options], help="Export completed traces as OTLP/HTTP JSON"
     )
-    reprice.add_argument("--db", default=str(default_db_path()), help="SQLite trace database path")
-    reprice.add_argument("--application", default=None, help="Only reprice one application")
-    reprice.add_argument("--provider", default=None, help="Only reprice one provider")
-    reprice.add_argument("--model", default=None, help="Only reprice one model")
-    reprice.add_argument(
-        "--since",
-        default=None,
-        help="Only include traces at or after this local ISO date/datetime",
+    export.add_argument(
+        "--output", default="nextrace-traces.otel.json", help="Local OTLP JSON file"
     )
-    reprice.add_argument(
-        "--until",
-        default=None,
-        help="Only include traces before this local ISO date/datetime",
+    export.add_argument(
+        "--endpoint", default=None, help="Optional full OTLP/HTTP traces URL, including /v1/traces"
     )
-    reprice.add_argument("--dry-run", action="store_true", help="Preview without updating rows")
+    export.add_argument("--trace-id", default=None, help="Export one execution")
+    export.add_argument("--application", default=None)
+    export.add_argument("--since", default=None, help="Inclusive local ISO date/datetime")
+    export.add_argument("--until", default=None, help="Exclusive local ISO date/datetime")
 
     set_project = subparsers.add_parser(
         "set-project",
@@ -209,104 +205,42 @@ def _build_parser(prog: str) -> argparse.ArgumentParser:
         help="Optional active-project state file path",
     )
 
+    for command, handler in (
+        (dashboard, run_dashboard),
+        (mcp_proxy, run_stdio_proxy),
+        (http_proxy, run_http_proxy),
+        (codex_import, run_codex_import),
+        (claude_import, run_claude_import),
+        (pi_import, run_pi_import),
+        (local_import, run_import_local_usage),
+        (set_project, run_set_project),
+        (export, run_export_otel),
+    ):
+        command.set_defaults(handler=handler)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     prog = Path(sys.argv[0]).name if argv is None else "nextrace"
     parser = _build_parser(prog)
-    return _run_command(parser, parser.parse_args(argv))
-
-
-def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    if args.command is None:
+    options = vars(parser.parse_args(argv))
+    command = options.pop("command_name")
+    handler = options.pop("handler", None)
+    if handler is None:
         parser.print_help()
         return 0
-    if args.command == "dashboard":
-        return run_dashboard(args.db, args.host, args.port, args.reload)
-    if args.command == "mcp-proxy":
-        command = args.child_command
-        if command and command[0] == "--":
-            command = command[1:]
-        return run_mcp_proxy(args.application, args.server, args.db, args.session_id, command)
-    if args.command == "mcp-http-proxy":
-        return run_mcp_http_proxy(
-            args.application,
-            args.server,
-            args.target,
-            args.host,
-            args.port,
-            args.db,
-            args.session_id,
-            args.timeout,
-        )
-    if args.command == "codex-import":
-        return run_codex_import(
-            application=args.application,
-            db_path=args.db,
-            codex_home=args.codex_home,
-            session_ids=args.session_id,
-            session_files=args.session_file,
-            latest=args.latest,
-            provider=args.provider,
-            model=args.model,
-            input_cost_per_million=args.input_cost_per_million,
-            cached_input_cost_per_million=args.cached_input_cost_per_million,
-            output_cost_per_million=args.output_cost_per_million,
-        )
-    if args.command == "claude-import":
-        return run_claude_import(
-            application=args.application,
-            db_path=args.db,
-            claude_home=args.claude_home,
-            project_path=args.project_path,
-            session_files=args.session_file,
-            latest=args.latest,
-            provider=args.provider,
-        )
-    if args.command == "pi-import":
-        return run_pi_import(
-            application=args.application,
-            db_path=args.db,
-            pi_home=args.pi_home,
-            project_path=args.project_path,
-            session_files=args.session_file,
-            latest=args.latest,
-        )
-    if args.command == "import-local-usage":
-        return run_import_local_usage(
-            db_path=args.db,
-            codex_home=args.codex_home,
-            claude_home=args.claude_home,
-            pi_home=args.pi_home,
-            state_path=args.state_path,
-            source=args.source,
-            full=args.full,
-        )
-    if args.command == "reprice":
-        return run_reprice(
-            db_path=args.db,
-            application=args.application,
-            provider=args.provider,
-            model=args.model,
-            since=args.since,
-            until=args.until,
-            dry_run=args.dry_run,
-        )
-    if args.command == "set-project":
-        return run_set_project(
-            project_path=args.project_path,
-            application=args.application,
-            state_path=args.state_path,
-        )
-    parser.error(f"Unknown command: {args.command}")
+    if command == "mcp-proxy" and options["command"][:1] == ["--"]:
+        options["command"] = options["command"][1:]
+    return handler(**options)
 
 
 def run_dashboard(db_path: str, host: str, port: int, reload: bool) -> int:
     try:
         import uvicorn
     except ImportError:
-        print('Dashboard dependencies are missing. Install with: python -m pip install -e ".[dashboard]"')
+        print(
+            'Dashboard dependencies are missing. Install with: python -m pip install -e ".[dashboard]"'
+        )
         return 1
 
     from nextrace.dashboard.app import create_app
@@ -314,50 +248,16 @@ def run_dashboard(db_path: str, host: str, port: int, reload: bool) -> int:
     app = create_app(Path(db_path))
     print(f"Nextrace dashboard: http://{host}:{port}")
     print(f"Trace database: {Path(db_path).expanduser()}")
-    uvicorn.run(app, host=host, port=port, reload=reload)
+    if reload:
+        import os
+
+        os.environ["NEXTRACE_DB"] = str(Path(db_path).expanduser().resolve())
+        uvicorn.run(
+            "nextrace.dashboard.app:create_app", factory=True, host=host, port=port, reload=True
+        )
+    else:
+        uvicorn.run(app, host=host, port=port)
     return 0
-
-
-def run_mcp_proxy(
-    application: str,
-    server: str,
-    db_path: str,
-    session_id: str | None,
-    child_command: list[str],
-) -> int:
-    from nextrace.mcp_proxy import run_stdio_proxy
-
-    return run_stdio_proxy(
-        application=application,
-        server=server,
-        db_path=db_path,
-        session_id=session_id,
-        command=child_command,
-    )
-
-
-def run_mcp_http_proxy(
-    application: str,
-    server: str,
-    target: str,
-    host: str,
-    port: int,
-    db_path: str,
-    session_id: str | None,
-    timeout: float,
-) -> int:
-    from nextrace.mcp_proxy import run_http_proxy
-
-    return run_http_proxy(
-        application=application,
-        server=server,
-        target_url=target,
-        host=host,
-        port=port,
-        db_path=db_path,
-        session_id=session_id,
-        timeout=timeout,
-    )
 
 
 def run_codex_import(
@@ -370,11 +270,7 @@ def run_codex_import(
     latest: int,
     provider: str | None,
     model: str | None,
-    input_cost_per_million: float | None,
-    cached_input_cost_per_million: float | None,
-    output_cost_per_million: float | None,
 ) -> int:
-    from nextrace import SQLiteStore
     from nextrace.codex_usage import find_codex_session_files, import_codex_usage
 
     files = [Path(path).expanduser() for path in session_files]
@@ -384,35 +280,16 @@ def run_codex_import(
             session_ids=session_ids,
             latest=latest,
         )
-    if not files:
-        print("No Codex session files found.")
-        return 1
-    store = SQLiteStore(db_path)
-    stats = import_codex_usage(
-        store=store,
-        application=application,
-        files=files,
-        input_cost_per_million=input_cost_per_million,
-        cached_input_cost_per_million=cached_input_cost_per_million,
-        output_cost_per_million=output_cost_per_million,
+    return _import_sessions(
+        files,
+        application,
+        db_path,
+        "codex",
+        "Codex",
+        import_codex_usage,
         provider_override=provider,
         model_override=model,
     )
-    store.record_connection(
-        application=application,
-        source="codex",
-        transport="jsonl-import",
-        status="connected",
-        metadata={"files": stats.files, "records": stats.imported},
-    )
-    print(f"Imported {stats.imported} Codex model usage records from {stats.files} file(s).")
-    if (
-        input_cost_per_million is None
-        and cached_input_cost_per_million is None
-        and output_cost_per_million is None
-    ):
-        print("Default pricing presets were used when available. Pass token prices to override them.")
-    return 0
 
 
 def run_claude_import(
@@ -425,7 +302,6 @@ def run_claude_import(
     latest: int | None,
     provider: str,
 ) -> int:
-    from nextrace import SQLiteStore
     from nextrace.claude_usage import find_claude_project_files, import_claude_usage
 
     files = [Path(path).expanduser() for path in session_files]
@@ -435,26 +311,15 @@ def run_claude_import(
             project_path=project_path,
             latest=latest,
         )
-    if not files:
-        print("No Claude Code transcript files found.")
-        return 1
-
-    store = SQLiteStore(db_path)
-    stats = import_claude_usage(
-        store=store,
-        application=application,
-        files=files,
+    return _import_sessions(
+        files,
+        application,
+        db_path,
+        "claude-code",
+        "Claude Code",
+        import_claude_usage,
         provider=provider,
     )
-    store.record_connection(
-        application=application,
-        source="claude-code",
-        transport="jsonl-import",
-        status="connected",
-        metadata={"files": stats.files, "records": stats.imported},
-    )
-    print(f"Imported {stats.imported} Claude Code model usage records from {stats.files} file(s).")
-    return 0
 
 
 def run_pi_import(
@@ -466,7 +331,6 @@ def run_pi_import(
     session_files: list[str],
     latest: int | None,
 ) -> int:
-    from nextrace import SQLiteStore
     from nextrace.pi_usage import find_pi_session_files, import_pi_usage
 
     files = [Path(path).expanduser() for path in session_files]
@@ -476,20 +340,34 @@ def run_pi_import(
             project_path=project_path,
             latest=latest,
         )
+    return _import_sessions(files, application, db_path, "pi", "Pi", import_pi_usage)
+
+
+def _import_sessions(
+    files: list[Path],
+    application: str,
+    db_path: str,
+    source: str,
+    label: str,
+    importer: Callable[..., Any],
+    **kwargs: Any,
+) -> int:
     if not files:
-        print("No Pi session files found.")
+        print(f"No {label} session files found.")
         return 1
+    from nextrace.storage import SQLiteStore
 
     store = SQLiteStore(db_path)
-    stats = import_pi_usage(store=store, application=application, files=files)
+    stats = importer(store=store, application=application, files=files, **kwargs)
     store.record_connection(
         application=application,
-        source="pi",
+        source=source,
         transport="jsonl-import",
-        status="connected",
         metadata={"files": stats.files, "records": stats.imported},
     )
-    print(f"Imported {stats.imported} Pi model usage records from {stats.files} file(s).")
+    print(
+        f"Imported {stats.imported} {label} model records in correlated turns from {stats.files} file(s)."
+    )
     return 0
 
 
@@ -535,41 +413,56 @@ def run_import_local_usage(
     return 0
 
 
-def run_reprice(
+def run_export_otel(
     *,
     db_path: str,
+    output: str,
+    endpoint: str | None,
+    trace_id: str | None,
     application: str | None,
-    provider: str | None,
-    model: str | None,
     since: str | None,
     until: str | None,
-    dry_run: bool,
 ) -> int:
-    from nextrace.repricing import reprice_model_spans
+    from nextrace.files import write_json_atomic
+    from nextrace.otel import export_traces, send_otlp
+    from nextrace.storage import SQLiteStore
 
     try:
-        since_ts = _parse_local_time_arg(since)
-        until_ts = _parse_local_time_arg(until)
-    except ValueError as error:
-        print(str(error))
-        return 2
-
-    stats = reprice_model_spans(
-        db_path=db_path,
-        application=application,
-        provider=provider,
-        model=model,
-        since=since_ts,
-        until=until_ts,
-        dry_run=dry_run,
-    )
-    action = "Would reprice" if dry_run else "Repriced"
-    print(
-        f"{action} {stats.repriced} of {stats.matched} model span(s); "
-        f"skipped {stats.skipped} without pricing."
-    )
-    print(f"Cost before: ${stats.cost_before:.2f}")
-    print(f"Cost after:  ${stats.cost_after:.2f}")
+        start, end = _parse_local_time_arg(since), _parse_local_time_arg(until)
+        if start is not None and end is not None and start >= end:
+            raise ValueError("--until must be after --since")
+        store = SQLiteStore(db_path)
+        if trace_id:
+            trace = store.get_trace(trace_id)
+            if trace is None:
+                raise ValueError("Trace not found")
+            traces = [trace]
+        else:
+            traces = [
+                store.get_trace(row["id"], correlate=False)
+                for row in store.list_traces(
+                    limit=None, application=application, since=start, until=end
+                )
+            ]
+        payload = export_traces(t for t in traces if t is not None)
+        skipped = sum(
+            t is not None and (t["ended_at"] is None or t["status"] == "running") for t in traces
+        )
+        if skipped:
+            print(f"Skipped {skipped} recordings without observed completion.")
+        write_json_atomic(Path(output).expanduser(), payload)
+        count = sum(
+            len(scope["spans"])
+            for resource in payload["resourceSpans"]
+            for scope in resource["scopeSpans"]
+        )
+        print(f"Exported {count} spans to {Path(output).expanduser()}")
+        if endpoint and count:
+            send_otlp(payload, endpoint)
+            print("OTLP collector accepted the export.")
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 

@@ -1,24 +1,37 @@
-"""Redacting MCP proxy utilities."""
-
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, BinaryIO
 
 from nextrace import SQLiteStore, Trace
 from nextrace.context import default_db_path
+from nextrace.core import error_status
 from nextrace.integrations._utils import is_sensitive_key, redact_url
-from nextrace.project import resolve_application
+from nextrace.mcp_protocol import (
+    HTTPResponseInspector,
+    correlation_ids,
+    diagnostic_text,
+    jsonrpc_id_key,
+    message_params,
+    response_error,
+    response_error_details,
+)
+from nextrace.project import read_current_project, resolve_application
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -35,7 +48,6 @@ HOP_BY_HOP_HEADERS = {
 
 
 def summarize_json(value: Any, *, max_items: int = 8) -> Any:
-    """Return a content-safe shape summary for JSON-like data."""
     if isinstance(value, dict):
         summary: dict[str, Any] = {}
         for index, (key, item) in enumerate(value.items()):
@@ -65,7 +77,6 @@ def summarize_json(value: Any, *, max_items: int = 8) -> Any:
 
 
 def summarize_headers(headers: dict[str, str]) -> dict[str, Any]:
-    """Summarize headers while preserving useful non-secret routing hints."""
     summary: dict[str, Any] = {}
     for key, value in headers.items():
         if is_sensitive_key(key):
@@ -75,10 +86,6 @@ def summarize_headers(headers: dict[str, str]) -> dict[str, Any]:
     return summary
 
 
-def jsonrpc_id_key(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, default=str)
-
-
 @dataclass
 class PendingMCPCall:
     request_id: str
@@ -86,13 +93,13 @@ class PendingMCPCall:
     name: str
     arguments: Any
     metadata: dict[str, Any]
-    trace: Any
+    trace: Trace
     started_at: float
+    response_ids: tuple[str, ...] = ()
+    http_scope: str | None = field(default=None, repr=False)
 
 
 class MCPTraceRecorder:
-    """Records MCP JSON-RPC calls without storing raw request or response content."""
-
     def __init__(
         self,
         *,
@@ -110,36 +117,41 @@ class MCPTraceRecorder:
         self.session_id = session_id
         self.connection_metadata = connection_metadata or {}
         self._pending: dict[str, PendingMCPCall] = {}
+        self._http_pending: dict[str, PendingMCPCall] = {}
         self._lock = threading.RLock()
         self._connected_applications: set[str] = set()
         self._current_application()
 
     def observe_client_json(self, message: Any) -> None:
         if not isinstance(message, dict):
-            self._record_notification("jsonrpc.batch", {"batch_length": len(message)} if isinstance(message, list) else {})
+            self._record_notification(
+                "jsonrpc.batch", {"batch_length": len(message)} if isinstance(message, list) else {}
+            )
             return
         method = message.get("method")
         if not method:
             return
         request_id = message.get("id")
         if request_id is None:
+            if method == "notifications/cancelled":
+                params = message_params(message)
+                with self._lock:
+                    cancelled = self._pending.pop(jsonrpc_id_key(params.get("requestId")), None)
+                if cancelled is not None:
+                    self._finish_call(
+                        cancelled,
+                        {"response": "missing"},
+                        InterruptedError("MCP client requested cancellation"),
+                    )
             self._record_notification(method, self._metadata_for_message(message))
             return
 
-        name = self._span_name(message)
-        metadata = self._metadata_for_message(message)
-        metadata["request_id"] = summarize_json(request_id)
-        metadata["direction"] = "client_to_server"
-        trace = self._new_trace(name=name, jsonrpc_method=method)
-        trace.__enter__()
-        pending = PendingMCPCall(
-            request_id=jsonrpc_id_key(request_id),
-            method=method,
-            name=name,
-            arguments=self._arguments_for_message(message),
-            metadata=metadata,
-            trace=trace,
-            started_at=time.perf_counter(),
+        pending = self._start_call(
+            message,
+            metadata={
+                "request_id": summarize_json(request_id),
+                "direction": "client_to_server",
+            },
         )
         with self._lock:
             self._pending[pending.request_id] = pending
@@ -154,21 +166,92 @@ class MCPTraceRecorder:
             pending = self._pending.pop(request_id, None)
         if pending is None:
             return
-        elapsed_ms = (time.perf_counter() - pending.started_at) * 1000
-        error = message.get("error")
-        response_summary = self._response_summary(message)
-        span_error = summarize_json(error) if error is not None else None
-        if span_error is not None:
-            pending.trace.status = "error"
-            pending.trace.error = str(span_error)
-        pending.trace.tool_call(
+        details = response_error_details(message)
+        if details is not None:
+            pending.metadata["error_details"] = [details]
+        self._finish_call(pending, self._response_summary(message), response_error(message))
+
+    def _start_call(self, message: dict[str, Any], *, metadata: dict[str, Any]) -> PendingMCPCall:
+        name = self._span_name(message)
+        method = str(message.get("method") or "http.request")
+        trace = self._new_trace(name=name, jsonrpc_method=method)
+        context = message_params(message).get("_meta", {})
+        context = context.get("nextrace", {}) if isinstance(context, dict) else {}
+        headers = metadata.pop("correlation_headers", {})
+        metadata["correlation_ids"] = {
+            **correlation_ids({"jsonrpc_id": message.get("id")}),
+            **correlation_ids(message_params(message).get("_meta")),
+            **correlation_ids(headers),
+        }
+        if not isinstance(context, dict):
+            context = {}
+
+        def context_value(key):
+            value = context.get(key) or headers.get("x-nextrace-" + key.replace("_", "-"))
+            return value if isinstance(value, str) and 0 < len(value) <= 512 else None
+
+        session_id = (
+            context_value("session_id") or self.session_id or os.getenv("NEXTRACE_SESSION_ID")
+        )
+        turn_id = context_value("turn_id") or os.getenv("NEXTRACE_TURN_ID")
+        if session_id:
+            trace.session_id = session_id
+        if session_id and turn_id:
+            trace.turn_id = turn_id
+        cwd = context_value("project_path") or read_current_project().get("project_path")
+        if isinstance(cwd, str) and cwd:
+            trace.metadata["cwd"] = str(Path(cwd).expanduser().resolve())
+        if "http_method" in metadata:
+            trace.metadata["http_method"] = metadata["http_method"]
+        trace.__enter__()
+        return PendingMCPCall(
+            request_id=jsonrpc_id_key(message.get("id")),
+            method=method,
+            name=name,
+            arguments=self._arguments_for_message(message),
+            metadata={**self._metadata_for_message(message), **metadata},
+            trace=trace,
+            started_at=time.perf_counter(),
+        )
+
+    def _finish_call(
+        self,
+        pending: PendingMCPCall,
+        result: Any,
+        error: BaseException | str | None,
+        *,
+        kind: str = "tool",
+    ) -> None:
+        status = error_status(error) if error is not None else "ok"
+        metadata = dict(pending.metadata)
+        if isinstance(error, BaseException):
+            metadata["exception_type"] = type(error).__name__
+            metadata["traceback"] = diagnostic_text(
+                "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            )
+        if kind == "tool" and status != "interrupted":
+            metadata["success"] = error is None
+        pending.trace.status = status
+        pending.trace.error = diagnostic_text(str(error)) if error is not None else None
+        for key in (
+            "error_details",
+            "correlation_ids",
+            "exception_type",
+            "traceback",
+            "http_status",
+        ):
+            if key in metadata:
+                pending.trace.metadata[key] = metadata[key]
+        pending.trace.record_span(
+            kind=kind,
             name=pending.name,
-            arguments=pending.arguments,
-            result=response_summary,
-            success=span_error is None,
-            latency_ms=elapsed_ms,
-            metadata=pending.metadata,
-            error=span_error,
+            prompt=pending.arguments,
+            response=result,
+            latency_ms=(time.perf_counter() - pending.started_at) * 1000,
+            metadata=metadata,
+            error=InterruptedError(pending.trace.error)
+            if status == "interrupted"
+            else pending.trace.error,
         )
         pending.trace.__exit__(None, None, None)
 
@@ -178,84 +261,139 @@ class MCPTraceRecorder:
         request_body: bytes,
         request_headers: dict[str, str],
         target_url: str,
+        http_method: str = "POST",
     ) -> PendingMCPCall:
+        http_method = http_method.upper()
+        headers = {key.lower(): value for key, value in request_headers.items()}
         message = decode_json_bytes(request_body)
         representative = message[0] if isinstance(message, list) and message else message
         if not isinstance(representative, dict):
             representative = {"method": "http.request", "params": {}}
-        name = self._span_name(representative)
-        method = str(representative.get("method") or "http.request")
-        metadata = self._metadata_for_message(representative)
-        metadata.update(
-            {
+        pending = self._start_call(
+            representative,
+            metadata={
+                "correlation_headers": headers,
                 "direction": "client_to_http_server",
                 "http_target": redact_url(target_url),
+                "http_method": http_method,
                 "headers": summarize_headers(request_headers),
                 "batch_length": len(message) if isinstance(message, list) else None,
-            }
+            },
         )
-        trace = self._new_trace(name=name, jsonrpc_method=method)
-        trace.__enter__()
-        return PendingMCPCall(
-            request_id=jsonrpc_id_key(representative.get("id")),
-            method=method,
-            name=name,
-            arguments=self._arguments_for_message(representative),
-            metadata=metadata,
-            trace=trace,
-            started_at=time.perf_counter(),
+        messages = message if isinstance(message, list) else [representative]
+        pending.response_ids = tuple(
+            jsonrpc_id_key(item["id"])
+            for item in messages
+            if isinstance(item, dict) and "method" in item and item.get("id") is not None
         )
+        session = headers.get("mcp-session-id")
+        if session:
+            identity = headers.get("authorization", "") + "\0" + session
+            pending.http_scope = hashlib.sha256(identity.encode()).hexdigest()
+        with self._lock:
+            self._http_pending[pending.trace.trace_id] = pending
+        if pending.method == "notifications/cancelled":
+            self._cancel_http_calls(message_params(representative).get("requestId"), pending)
+        return pending
+
+    def _cancel_http_calls(self, request_id: Any, notification: PendingMCPCall) -> None:
+        if request_id is None or notification.http_scope is None:
+            return
+        request_key = jsonrpc_id_key(request_id)
+        with self._lock:
+            cancelled = [
+                call
+                for call in self._http_pending.values()
+                if call.http_scope == notification.http_scope
+                and request_key in call.response_ids
+                and call is not notification
+            ]
+        for call in cancelled:
+            self.finish_http_call(
+                call,
+                status_code=None,
+                response_bytes=None,
+                error=InterruptedError("MCP client requested cancellation"),
+            )
 
     def finish_http_call(
         self,
         pending: PendingMCPCall,
         *,
         status_code: int | None,
-        response_bytes: int,
+        response_bytes: int | None,
         response_headers: dict[str, str] | None = None,
+        inspection: HTTPResponseInspector | None = None,
         error: BaseException | str | None = None,
     ) -> None:
-        elapsed_ms = (time.perf_counter() - pending.started_at) * 1000
-        span_error = error
-        if span_error is None and (status_code is None or status_code >= 400):
-            span_error = f"HTTP {status_code if status_code is not None else 'unknown'}"
-        if span_error is not None:
-            pending.trace.status = "error"
-            pending.trace.error = str(span_error)
+        with self._lock:
+            if self._http_pending.pop(pending.trace.trace_id, None) is None:
+                return
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            error = InterruptedError("Connection closed before recording the complete response")
+        if (
+            error is None
+            and inspection is not None
+            and status_code is not None
+            and status_code < 400
+        ):
+            if inspection.error is not None:
+                error = inspection.error
+            elif pending.response_ids and not inspection.complete:
+                error = InterruptedError(
+                    inspection.problem or "MCP response ended before a matching result was received"
+                )
+        http_method = pending.metadata["http_method"]
+        is_transport = pending.method == "http.request" and http_method in {
+            "GET",
+            "DELETE",
+            "OPTIONS",
+        }
+        # MCP permits 405 for the optional event stream and session cleanup.
+        outcome = None
+        if error is None and is_transport and status_code == 405:
+            outcome = {
+                "GET": "event_stream_not_supported",
+                "DELETE": "session_termination_not_supported",
+            }.get(http_method)
+        if error is None and outcome is None and (status_code is None or status_code >= 400):
+            error = f"HTTP {status_code if status_code is not None else 'unknown'}"
         result = {
+            "http_method": http_method,
             "http_status": status_code,
             "response_bytes": response_bytes,
             "headers": summarize_headers(response_headers or {}),
         }
-        pending.trace.tool_call(
-            name=pending.name,
-            arguments=pending.arguments,
-            result=result,
-            success=span_error is None,
-            latency_ms=elapsed_ms,
-            metadata=pending.metadata,
-            error=str(span_error) if span_error else None,
-        )
-        pending.trace.__exit__(None, None, None)
+        pending.metadata["http_status"] = status_code
+        pending.metadata["correlation_ids"].update(correlation_ids(response_headers))
+        if inspection is not None and pending.response_ids:
+            result["mcp_response_complete"] = inspection.complete
+            if inspection.problem:
+                result["inspection_problem"] = inspection.problem
+            if inspection.error:
+                result["mcp_error"] = inspection.error
+        if inspection is not None and inspection.error_details and error is not None:
+            pending.metadata["error_details"] = inspection.error_details
+        if outcome is not None:
+            result["transport_outcome"] = outcome
+            pending.metadata["transport_outcome"] = outcome
+            pending.trace.metadata["transport_outcome"] = outcome
+        self._finish_call(pending, result, error, kind="transport" if is_transport else "tool")
 
-    def finish_pending_with_error(self, error: BaseException | str) -> None:
+    def interrupt_pending(self, error: BaseException | str) -> None:
+        interruption = (
+            error if isinstance(error, InterruptedError) else InterruptedError(str(error))
+        )
         with self._lock:
             pending_calls = list(self._pending.values())
             self._pending.clear()
+            http_calls = list(self._http_pending.values())
         for pending in pending_calls:
-            elapsed_ms = (time.perf_counter() - pending.started_at) * 1000
-            pending.trace.status = "error"
-            pending.trace.error = str(error)
-            pending.trace.tool_call(
-                name=pending.name,
-                arguments=pending.arguments,
-                result={"response": "missing"},
-                success=False,
-                latency_ms=elapsed_ms,
-                metadata=pending.metadata,
-                error=str(error),
+            self._finish_call(pending, {"response": "missing"}, interruption)
+        for pending in http_calls:
+            self.finish_http_call(
+                pending, status_code=None, response_bytes=None, error=interruption
             )
-            pending.trace.__exit__(None, None, None)
 
     def _record_notification(self, method: str, metadata: dict[str, Any]) -> None:
         with self._new_trace(name=method, jsonrpc_method=method) as trace:
@@ -295,7 +433,7 @@ class MCPTraceRecorder:
 
     def _span_name(self, message: dict[str, Any]) -> str:
         method = str(message.get("method") or "unknown")
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        params = message_params(message)
         if method == "tools/call" and params.get("name"):
             return f"tool:{params['name']}"
         if method == "resources/read" and params.get("uri"):
@@ -305,13 +443,13 @@ class MCPTraceRecorder:
         return method
 
     def _arguments_for_message(self, message: dict[str, Any]) -> Any:
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        params = message_params(message)
         if message.get("method") == "tools/call":
             return summarize_json(params.get("arguments", {}))
         return summarize_json(params)
 
     def _metadata_for_message(self, message: dict[str, Any]) -> dict[str, Any]:
-        params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        params = message_params(message)
         metadata = {
             "server": self.server,
             "transport": self.transport,
@@ -338,22 +476,12 @@ class MCPTraceRecorder:
         return {"summary": summarize_json(result)}
 
 
-def decode_json_line(line: bytes) -> Any | None:
-    stripped = line.strip()
-    if not stripped:
-        return None
-    try:
-        return json.loads(stripped.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-
-
 def decode_json_bytes(body: bytes) -> Any | None:
     if not body:
         return None
     try:
         return json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (ValueError, RecursionError):
         return None
 
 
@@ -401,55 +529,78 @@ def run_stdio_proxy(
             except OSError:
                 pass
 
-    def child_to_client() -> None:
-        copy_json_lines(
-            source=process.stdout,
-            target=sys.stdout.buffer,
-            observer=recorder.observe_server_json,
-        )
-
-    def child_stderr_to_stderr() -> None:
-        copy_bytes(process.stderr, sys.stderr.buffer)
-
     threads = [
         threading.Thread(target=client_to_child, daemon=True),
-        threading.Thread(target=child_to_client, daemon=True),
-        threading.Thread(target=child_stderr_to_stderr, daemon=True),
+        threading.Thread(
+            target=copy_json_lines,
+            kwargs={
+                "source": process.stdout,
+                "target": sys.stdout.buffer,
+                "observer": recorder.observe_server_json,
+            },
+            daemon=True,
+        ),
+        threading.Thread(target=copy_bytes, args=(process.stderr, sys.stderr.buffer), daemon=True),
     ]
     for thread in threads:
         thread.start()
-    return_code = process.wait()
+    try:
+        with _shutdown_signals():
+            return_code = process.wait()
+    except KeyboardInterrupt:
+        process.terminate()
+        try:
+            return_code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return_code = process.wait()
     for thread in threads[1:]:
         thread.join(timeout=1)
     if return_code != 0:
-        recorder.finish_pending_with_error(f"MCP child exited with code {return_code}")
+        recorder.interrupt_pending(f"MCP child exited with code {return_code}")
     else:
-        recorder.finish_pending_with_error("MCP child exited before response")
+        recorder.interrupt_pending("MCP child exited before response")
     return return_code
 
 
+def _observe(observer, *args, **kwargs):
+    try:
+        return observer(*args, **kwargs)
+    except Exception as exc:
+        # Observability must not interrupt traffic to the MCP server.
+        print(f"nextrace recorder: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+
+
 def copy_json_lines(*, source: BinaryIO, target: BinaryIO, observer: Any) -> None:
-    while True:
-        line = source.readline()
-        if not line:
-            break
-        message = decode_json_line(line)
+    while line := source.readline():
+        message = decode_json_bytes(line)
         if message is not None:
-            try:
-                observer(message)
-            except Exception as exc:  # pragma: no cover - defensive: proxy must keep traffic flowing.
-                print(f"nextrace mcp-proxy recorder error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            _observe(observer, message)
         target.write(line)
         target.flush()
 
 
 def copy_bytes(source: BinaryIO, target: BinaryIO) -> None:
-    while True:
-        chunk = source.read(65536)
-        if not chunk:
-            break
+    while chunk := source.read(65536):
         target.write(chunk)
         target.flush()
+
+
+@contextmanager
+def _shutdown_signals():
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def stop(_signal, _frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def run_http_proxy(
@@ -476,18 +627,6 @@ def run_http_proxy(
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def do_GET(self) -> None:  # noqa: N802
-            self._proxy()
-
-        def do_POST(self) -> None:  # noqa: N802
-            self._proxy()
-
-        def do_DELETE(self) -> None:  # noqa: N802
-            self._proxy()
-
-        def do_OPTIONS(self) -> None:  # noqa: N802
-            self._proxy()
-
         def log_message(self, format: str, *args: Any) -> None:
             print(f"nextrace mcp-http-proxy: {format % args}", file=sys.stderr)
 
@@ -501,10 +640,12 @@ def run_http_proxy(
                 if key.lower() not in HOP_BY_HOP_HEADERS
             }
             destination = build_target_url(target_url, self.path)
-            pending = recorder.record_http_call(
+            pending = _observe(
+                recorder.record_http_call,
                 request_body=body,
                 request_headers=incoming_headers,
                 target_url=destination,
+                http_method=self.command,
             )
             request = urllib.request.Request(
                 destination,
@@ -515,6 +656,21 @@ def run_http_proxy(
             status_code: int | None = None
             response_headers: dict[str, str] = {}
             response_bytes = 0
+            error = None
+            inspection = None
+
+            def record_response(error=None):
+                if pending is not None:
+                    _observe(
+                        recorder.finish_http_call,
+                        pending,
+                        status_code=status_code,
+                        response_bytes=response_bytes,
+                        response_headers=response_headers,
+                        inspection=inspection,
+                        error=error,
+                    )
+
             try:
                 try:
                     response = urllib.request.urlopen(request, timeout=timeout)
@@ -523,50 +679,61 @@ def run_http_proxy(
                 with response:
                     status_code = int(response.status)
                     response_headers = dict(response.headers.items())
+                    if pending is not None:
+                        inspection = HTTPResponseInspector(
+                            response_headers, pending.response_ids, status_code=status_code
+                        )
                     self.send_response(status_code)
                     for key, value in response.headers.items():
                         if key.lower() not in HOP_BY_HOP_HEADERS:
                             self.send_header(key, value)
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    while chunk := response.read(65536):
+                    read_chunk = getattr(response, "read1", response.read)
+                    while chunk := read_chunk(65536):
                         response_bytes += len(chunk)
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                recorder.finish_http_call(
-                    pending,
-                    status_code=status_code,
-                    response_bytes=response_bytes,
-                    response_headers=response_headers,
-                )
+                        if inspection is not None:
+                            _observe(inspection.feed, chunk)
+                            if inspection.complete:
+                                record_response()
+                    if inspection is not None:
+                        _observe(inspection.finish)
             except Exception as exc:
+                error = exc
                 if status_code is None:
                     self.send_response(502)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Connection", "close")
                     self.end_headers()
-                    payload = json.dumps({"error": "MCP proxy upstream request failed"}).encode("utf-8")
+                    payload = json.dumps({"error": "MCP proxy upstream request failed"}).encode(
+                        "utf-8"
+                    )
                     self.wfile.write(payload)
                     response_bytes = len(payload)
                     status_code = 502
-                recorder.finish_http_call(
-                    pending,
-                    status_code=status_code,
-                    response_bytes=response_bytes,
-                    response_headers=response_headers,
-                    error=exc,
-                )
+            finally:
+                record_response(error)
+
+        do_GET = do_POST = do_DELETE = do_OPTIONS = _proxy
 
     httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.daemon_threads = True
     print(
-        f"Nextrace MCP HTTP proxy: http://{host}:{port} -> {target_url}",
+        f"Nextrace MCP HTTP proxy: http://{host}:{port} -> {redact_url(target_url)}",
         file=sys.stderr,
     )
     try:
-        httpd.serve_forever()
+        with _shutdown_signals():
+            httpd.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
+        _observe(
+            recorder.interrupt_pending,
+            "MCP HTTP proxy stopped before completing the response",
+        )
         httpd.server_close()
     return 0
 
@@ -580,4 +747,6 @@ def build_target_url(target_url: str, incoming_path: str) -> str:
     if incoming.query:
         query_parts.append(incoming.query)
     query = "&".join(query_parts)
-    return urllib.parse.urlunsplit((target.scheme, target.netloc, target.path, query, target.fragment))
+    return urllib.parse.urlunsplit(
+        (target.scheme, target.netloc, target.path, query, target.fragment)
+    )

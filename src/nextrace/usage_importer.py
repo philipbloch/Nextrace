@@ -1,5 +1,3 @@
-"""Bulk local usage imports for supported AI coding agents."""
-
 from __future__ import annotations
 
 import json
@@ -8,11 +6,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from nextrace.claude_usage import import_claude_usage
+from nextrace.claude_usage import find_claude_project_files, import_claude_usage
 from nextrace.codex_usage import import_codex_usage
-from nextrace.pi_usage import import_pi_usage
+from nextrace.files import write_json_atomic
+from nextrace.pi_usage import find_pi_session_files, import_pi_usage
 from nextrace.project import application_from_project_path
 from nextrace.storage import SQLiteStore
+from nextrace.usage import read_jsonl, string_or_none
 
 DEFAULT_USAGE_IMPORT_STATE = Path("~/.nextrace/local-usage-import-state.json")
 
@@ -67,64 +67,51 @@ def import_local_usage(
     source: str = "all",
     full: bool = False,
 ) -> LocalUsageImportStats:
-    """Import changed local AI-agent usage files grouped by project."""
     selected_sources = _selected_sources(source)
     state = _empty_state() if full else _load_state(state_path)
     stats = LocalUsageImportStats()
 
-    if "codex" in selected_sources:
-        codex_files = _changed_files(_find_codex_files(codex_home), state, full=full)
-        grouped = _group_files_by_application(codex_files, _codex_project_path, stats)
+    sources = (
+        ("codex", codex_home, _find_codex_files, _codex_project_path, import_codex_usage),
+        (
+            "claude",
+            claude_home,
+            lambda home: find_claude_project_files(claude_home=home),
+            _claude_project_path,
+            import_claude_usage,
+        ),
+        (
+            "pi",
+            pi_home,
+            lambda home: find_pi_session_files(pi_home=home),
+            _pi_project_path,
+            import_pi_usage,
+        ),
+    )
+    for name, home, find_files, project_path, importer in sources:
+        if name not in selected_sources:
+            continue
+        changed = _changed_files(find_files(home), state, full=full)
+        grouped = _group_files_by_application(changed, project_path, stats)
         for application, files in grouped.items():
-            result = import_codex_usage(store=store, application=application, files=files)
+            result = importer(store=store, application=application, files=files)
             app_stats = stats.applications.setdefault(application, ApplicationUsageImportStats())
-            app_stats.codex_files += len(files)
-            app_stats.codex_records += result.imported
+            for metric, value in (("files", result.files), ("records", result.imported)):
+                key = f"{name}_{metric}"
+                setattr(app_stats, key, getattr(app_stats, key) + value)
             store.record_connection(
                 application=application,
-                source="codex",
+                source="claude-code" if name == "claude" else name,
                 transport="jsonl-auto-import",
-                status="connected",
-                metadata={"files": len(files), "records": result.imported, "auto_import": True},
+                metadata={"files": result.files, "records": result.imported, "auto_import": True},
             )
-            _mark_imported(state, files)
+            # A writer may append during import; never mark unread bytes as imported.
+            state["files"].update({_state_key(path): changed[path] for path in files})
 
-    if "claude" in selected_sources:
-        claude_files = _changed_files(_find_claude_files(claude_home), state, full=full)
-        grouped = _group_files_by_application(claude_files, _claude_project_path, stats)
-        for application, files in grouped.items():
-            result = import_claude_usage(store=store, application=application, files=files)
-            app_stats = stats.applications.setdefault(application, ApplicationUsageImportStats())
-            app_stats.claude_files += len(files)
-            app_stats.claude_records += result.imported
-            store.record_connection(
-                application=application,
-                source="claude-code",
-                transport="jsonl-auto-import",
-                status="connected",
-                metadata={"files": len(files), "records": result.imported, "auto_import": True},
-            )
-            _mark_imported(state, files)
-
-    if "pi" in selected_sources:
-        pi_files = _changed_files(_find_pi_files(pi_home), state, full=full)
-        grouped = _group_files_by_application(pi_files, _pi_project_path, stats)
-        for application, files in grouped.items():
-            result = import_pi_usage(store=store, application=application, files=files)
-            app_stats = stats.applications.setdefault(application, ApplicationUsageImportStats())
-            app_stats.pi_files += len(files)
-            app_stats.pi_records += result.imported
-            store.record_connection(
-                application=application,
-                source="pi",
-                transport="jsonl-auto-import",
-                status="connected",
-                metadata={"files": len(files), "records": result.imported, "auto_import": True},
-            )
-            _mark_imported(state, files)
-
+    if full:
+        store.consolidate_legacy_models()
     if state_path is not None:
-        _save_state(state_path, state)
+        write_json_atomic(Path(state_path).expanduser(), state)
     return stats
 
 
@@ -146,20 +133,6 @@ def _find_codex_files(codex_home: str | Path) -> list[Path]:
     return sorted(set(files))
 
 
-def _find_claude_files(claude_home: str | Path) -> list[Path]:
-    root = Path(claude_home).expanduser() / "projects"
-    if not root.exists():
-        return []
-    return sorted(set(root.glob("*/*.jsonl")))
-
-
-def _find_pi_files(pi_home: str | Path) -> list[Path]:
-    root = Path(pi_home).expanduser() / "sessions"
-    if not root.exists():
-        return []
-    return sorted(set(root.glob("*/*.jsonl")))
-
-
 def _group_files_by_application(
     files: Iterable[Path],
     project_path_for_file: Callable[[Path], str | None],
@@ -167,7 +140,10 @@ def _group_files_by_application(
 ) -> dict[str, list[Path]]:
     grouped: dict[str, list[Path]] = {}
     for file_path in files:
-        project_path = project_path_for_file(file_path)
+        try:
+            project_path = project_path_for_file(file_path)
+        except OSError:
+            project_path = None
         if project_path is None:
             stats.skipped_files += 1
             continue
@@ -178,53 +154,40 @@ def _group_files_by_application(
 
 def _codex_project_path(file_path: Path) -> str | None:
     project_path: str | None = None
-    for event in _read_jsonl_objects(file_path):
+    for _, event in read_jsonl(file_path):
         payload = event.get("payload")
         if isinstance(payload, dict):
-            cwd = _string_or_none(payload.get("cwd"))
+            cwd = string_or_none(payload.get("cwd"))
             if cwd:
                 project_path = cwd
     return project_path
 
 
 def _claude_project_path(file_path: Path) -> str | None:
-    for event in _read_jsonl_objects(file_path):
-        cwd = _string_or_none(event.get("cwd"))
+    for _, event in read_jsonl(file_path):
+        cwd = string_or_none(event.get("cwd"))
         if cwd:
             return cwd
     return None
 
 
 def _pi_project_path(file_path: Path) -> str | None:
-    for event in _read_jsonl_objects(file_path):
+    for _, event in read_jsonl(file_path):
         if event.get("type") != "session":
             continue
-        cwd = _string_or_none(event.get("cwd"))
+        cwd = string_or_none(event.get("cwd"))
         if cwd:
             return cwd
     return None
 
 
-def _read_jsonl_objects(file_path: Path) -> Iterable[dict[str, Any]]:
-    try:
-        with file_path.open(encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(event, dict):
-                    yield event
-    except OSError:
-        return
-
-
-def _string_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _changed_files(files: Iterable[Path], state: dict[str, Any], *, full: bool) -> list[Path]:
-    changed: list[Path] = []
+def _changed_files(
+    files: Iterable[Path],
+    state: dict[str, Any],
+    *,
+    full: bool,
+) -> dict[Path, dict[str, int]]:
+    changed = {}
     file_state = state.setdefault("files", {})
     for file_path in files:
         fingerprint = _fingerprint(file_path)
@@ -232,16 +195,8 @@ def _changed_files(files: Iterable[Path], state: dict[str, Any], *, full: bool) 
             continue
         key = _state_key(file_path)
         if full or file_state.get(key) != fingerprint:
-            changed.append(file_path)
+            changed[file_path] = fingerprint
     return changed
-
-
-def _mark_imported(state: dict[str, Any], files: Iterable[Path]) -> None:
-    file_state = state.setdefault("files", {})
-    for file_path in files:
-        fingerprint = _fingerprint(file_path)
-        if fingerprint is not None:
-            file_state[_state_key(file_path)] = fingerprint
 
 
 def _fingerprint(file_path: Path) -> dict[str, int] | None:
@@ -257,7 +212,7 @@ def _state_key(file_path: Path) -> str:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 1, "files": {}}
+    return {"version": 3, "files": {}}
 
 
 def _load_state(state_path: str | Path | None) -> dict[str, Any]:
@@ -268,12 +223,10 @@ def _load_state(state_path: str | Path | None) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return _empty_state()
-    if not isinstance(data, dict) or not isinstance(data.get("files"), dict):
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 3
+        or not isinstance(data.get("files"), dict)
+    ):
         return _empty_state()
     return data
-
-
-def _save_state(state_path: str | Path, state: dict[str, Any]) -> None:
-    path = Path(state_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")

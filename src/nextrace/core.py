@@ -1,37 +1,46 @@
-"""Core trace and span primitives."""
-
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import time
 import traceback
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import CancelledError as FutureCancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-from nextrace.pricing import default_pricing_registry
 from nextrace.storage import SQLiteStore
 from nextrace.types import JsonDict, SpanRecord, TraceRecord
 
 
 class TraceContextError(RuntimeError):
-    """Raised when a trace-only operation is used outside a trace."""
-
-
-def _now() -> float:
-    return time.time()
+    pass
 
 
 def _duration_ms(started_at: float, ended_at: float | None = None) -> float:
-    return round(((ended_at or _now()) - started_at) * 1000, 3)
+    return round(((time.time() if ended_at is None else ended_at) - started_at) * 1000, 3)
+
+
+def error_status(error: BaseException | str) -> str:
+    if isinstance(
+        error,
+        (
+            asyncio.CancelledError,
+            FutureCancelledError,
+            InterruptedError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ),
+    ):
+        return "interrupted"
+    return "error"
 
 
 @dataclass
 class Span:
-    """A timed operation inside a trace."""
-
     trace: Trace
     kind: str
     name: str
@@ -42,47 +51,48 @@ class Span:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
-    cost_usd: float | None = None
     retry_count: int = 0
     metadata: JsonDict = field(default_factory=dict)
     status: str = "ok"
     error: str | None = None
     span_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     parent_id: str | None = None
-    started_at: float = field(default_factory=_now)
+    started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
+    _active_token: contextvars.Token | None = field(default=None, init=False, repr=False)
 
     def __enter__(self) -> Span:
-        self.started_at = _now()
+        self.started_at = time.time()
         self.parent_id = self.trace.current_span_id
-        self.trace.current_span_id = self.span_id
+        self._active_token = self.trace._active_span.set(self.span_id)
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> bool:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any
+    ) -> bool:
         if exc is not None:
-            self.status = "error"
+            self.status = error_status(exc)
             self.error = f"{type(exc).__name__}: {exc}"
-            self.metadata.setdefault("traceback", "".join(traceback.format_exception(exc_type, exc, tb)))
+            self.metadata.setdefault(
+                "traceback", "".join(traceback.format_exception(exc_type, exc, tb))
+            )
         try:
             self.finish()
         finally:
-            self.trace.current_span_id = self.parent_id
+            if self._active_token is not None:
+                self.trace._active_span.reset(self._active_token)
+                self._active_token = None
         return False
 
     def finish(self) -> None:
         if self.ended_at is not None:
             return
-        self.ended_at = _now()
+        self.ended_at = time.time()
         if self.total_tokens is None:
             input_tokens = self.input_tokens or 0
             output_tokens = self.output_tokens or 0
-            self.total_tokens = input_tokens + output_tokens if input_tokens or output_tokens else None
-        if self.cost_usd is None and self.input_tokens is not None and self.output_tokens is not None:
-            self.cost_usd = default_pricing_registry.estimate(
-                provider=self.provider,
-                model=self.model,
-                input_tokens=self.input_tokens,
-                output_tokens=self.output_tokens,
+            self.total_tokens = (
+                input_tokens + output_tokens if input_tokens or output_tokens else None
             )
         self.trace.store.record_span(self.to_record())
 
@@ -93,7 +103,6 @@ class Span:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         total_tokens: int | None = None,
-        cost_usd: float | None = None,
         metadata: JsonDict | None = None,
     ) -> Span:
         if response is not None:
@@ -104,8 +113,6 @@ class Span:
             self.output_tokens = output_tokens
         if total_tokens is not None:
             self.total_tokens = total_tokens
-        if cost_usd is not None:
-            self.cost_usd = cost_usd
         if metadata:
             self.metadata.update(metadata)
         return self
@@ -117,7 +124,7 @@ class Span:
         return self
 
     def fail(self, error: BaseException | str) -> Span:
-        self.status = "error"
+        self.status = error_status(error)
         self.error = str(error)
         return self
 
@@ -142,7 +149,7 @@ class Span:
         return self.score("accuracy", value, comment=comment, metadata=metadata)
 
     def to_record(self) -> SpanRecord:
-        ended_at = self.ended_at or _now()
+        ended_at = time.time() if self.ended_at is None else self.ended_at
         return SpanRecord(
             id=self.span_id,
             trace_id=self.trace.trace_id,
@@ -159,7 +166,6 @@ class Span:
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
             total_tokens=self.total_tokens,
-            cost_usd=self.cost_usd,
             retry_count=self.retry_count,
             status=self.status,
             error=self.error,
@@ -169,23 +175,30 @@ class Span:
 
 @dataclass
 class Trace:
-    """A complete AI workflow trace."""
-
     application: str
     name: str | None = None
     trace_id: str | None = None
     session_id: str | None = None
+    turn_id: str | None = None
     user_id: str | None = None
     tags: list[str] | None = None
     metadata: JsonDict | None = None
     store: SQLiteStore | None = None
     active_trace_var: contextvars.ContextVar[Trace | None] | None = None
-    started_at: float = field(default_factory=_now)
+    started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
-    status: str = "ok"
+    status: str = "running"
     error: str | None = None
-    current_span_id: str | None = None
+    _active_span: contextvars.ContextVar[str | None] = field(
+        default_factory=lambda: contextvars.ContextVar("nextrace_active_span", default=None),
+        init=False,
+        repr=False,
+    )
     _active_token: contextvars.Token | None = field(default=None, init=False, repr=False)
+
+    @property
+    def current_span_id(self) -> str | None:
+        return self._active_span.get()
 
     def __post_init__(self) -> None:
         if self.trace_id is None:
@@ -204,7 +217,7 @@ class Trace:
             self.store = default_store()
 
     def __enter__(self) -> Trace:
-        self.started_at = _now()
+        self.started_at = time.time()
         if self.active_trace_var is not None:
             self._active_token = self.active_trace_var.set(self)
         try:
@@ -214,11 +227,15 @@ class Trace:
             raise
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> bool:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any
+    ) -> bool:
         if exc is not None:
-            self.status = "error"
+            self.status = error_status(exc)
             self.error = f"{type(exc).__name__}: {exc}"
-            self.metadata.setdefault("traceback", "".join(traceback.format_exception(exc_type, exc, tb)))
+            self.metadata.setdefault(
+                "traceback", "".join(traceback.format_exception(exc_type, exc, tb))
+            )
         try:
             self.finish()
         finally:
@@ -228,8 +245,15 @@ class Trace:
     def finish(self) -> None:
         if self.ended_at is not None:
             return
-        self.ended_at = _now()
+        self.ended_at = time.time()
+        if self.status == "running":
+            self.status = "ok"
         self.store.finish_trace(self.to_record())
+
+    def interrupt(self, reason: str) -> None:
+        self.status = "interrupted"
+        self.error = reason
+        self.finish()
 
     def _reset_active_trace(self) -> None:
         if self.active_trace_var is None or self._active_token is None:
@@ -272,13 +296,12 @@ class Trace:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         total_tokens: int | None = None,
-        cost_usd: float | None = None,
         latency_ms: float | None = None,
         retry_count: int = 0,
         metadata: JsonDict | None = None,
         error: BaseException | str | None = None,
     ) -> Span:
-        return self._instant_span(
+        return self.record_span(
             kind="model",
             name=name or f"{provider}:{model}",
             provider=provider,
@@ -288,7 +311,6 @@ class Trace:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
             latency_ms=latency_ms,
             retry_count=retry_count,
             metadata=metadata,
@@ -313,7 +335,7 @@ class Trace:
             metadata["accuracy"] = accuracy
         if success is not None:
             metadata["success"] = success
-        return self._instant_span(
+        return self.record_span(
             kind="tool",
             name=name,
             prompt=arguments,
@@ -335,7 +357,7 @@ class Trace:
         metadata: JsonDict | None = None,
         error: BaseException | str | None = None,
     ) -> Span:
-        return self._instant_span(
+        return self.record_span(
             kind="retrieval",
             name=name,
             provider=provider,
@@ -358,7 +380,7 @@ class Trace:
     ) -> Span:
         metadata = dict(metadata or {})
         metadata.update({"from_agent": from_agent, "to_agent": to_agent, "reason": reason})
-        return self._instant_span(
+        return self.record_span(
             kind="handoff",
             name=f"{from_agent} -> {to_agent}",
             prompt=payload,
@@ -401,7 +423,13 @@ class Trace:
             metadata=metadata or {},
         )
 
-    def retry(self, name: str, *, error: BaseException | str | None = None, metadata: JsonDict | None = None) -> None:
+    def retry(
+        self,
+        name: str,
+        *,
+        error: BaseException | str | None = None,
+        metadata: JsonDict | None = None,
+    ) -> None:
         self.store.record_event(
             trace_id=self.trace_id,
             span_id=self.current_span_id,
@@ -420,10 +448,11 @@ class Trace:
         )
 
     def to_record(self) -> TraceRecord:
-        ended_at = self.ended_at or _now()
+        ended_at = time.time() if self.ended_at is None else self.ended_at
         return TraceRecord(
             id=self.trace_id,
             session_id=self.session_id,
+            turn_id=self.turn_id,
             application=self.application,
             name=self.name or self.application,
             user_id=self.user_id,
@@ -436,7 +465,7 @@ class Trace:
             metadata=self.metadata or {},
         )
 
-    def _instant_span(
+    def record_span(
         self,
         *,
         kind: str,
@@ -448,13 +477,12 @@ class Trace:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         total_tokens: int | None = None,
-        cost_usd: float | None = None,
         latency_ms: float | None = None,
         retry_count: int = 0,
         metadata: JsonDict | None = None,
         error: BaseException | str | None = None,
     ) -> Span:
-        started_at = _now()
+        started_at = time.time()
         duration = latency_ms if latency_ms is not None else 0
         span = Span(
             trace=self,
@@ -467,7 +495,6 @@ class Trace:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            cost_usd=cost_usd,
             retry_count=retry_count,
             metadata=metadata or {},
             parent_id=self.current_span_id,

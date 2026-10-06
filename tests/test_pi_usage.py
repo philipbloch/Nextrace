@@ -81,12 +81,10 @@ def test_import_pi_usage_records_redacted_model_span(tmp_path):
     assert span["input_tokens"] == 650
     assert span["output_tokens"] == 20
     assert span["total_tokens"] == 670
-    assert span["cost_usd"] == 0.0123
     assert span["prompt"] == {"redacted": True, "source": "pi"}
     assert span["response"] == {"redacted": True, "source": "pi"}
     assert span["metadata"]["cache_read_input_tokens"] == 500
     assert span["metadata"]["cache_write_input_tokens"] == 50
-    assert span["metadata"]["cost_source"] == "pi-log"
 
     rendered = json.dumps(detail)
     assert "raw secret" not in rendered

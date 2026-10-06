@@ -1,12 +1,9 @@
-"""OpenAI integration helpers."""
-
 from __future__ import annotations
 
-import time
 from typing import Any
 
-from nextrace.context import current_trace
-from nextrace.integrations._utils import get_nested, record_model_span
+from nextrace.core import Trace
+from nextrace.integrations._utils import get_nested, model_span, set_model_result
 
 
 def traced_openai_chat(
@@ -14,42 +11,26 @@ def traced_openai_chat(
     *,
     model: str,
     messages: list[dict[str, Any]],
-    trace: Any | None = None,
+    trace: Trace | None = None,
     name: str = "openai.chat.completions.create",
     **kwargs: Any,
 ) -> Any:
-    """Call ``client.chat.completions.create`` and record a model span."""
-    active = trace or current_trace(required=True)
-    started = time.perf_counter()
-    try:
-        response = client.chat.completions.create(model=model, messages=messages, **kwargs)
-    except Exception as exc:
-        record_model_span(
-            active,
-            provider="openai",
-            model=model,
-            name=name,
-            prompt=messages,
-            response=None,
-            started_at=started,
-            kwargs=kwargs,
-            error=exc,
-        )
-        raise
-
-    record_model_span(
-        active,
+    with model_span(
         provider="openai",
         model=model,
         name=name,
         prompt=messages,
-        response=response,
-        started_at=started,
-        usage=get_nested(response, "usage"),
+        trace=trace,
         kwargs=kwargs,
-        response_id=get_nested(response, "id"),
-    )
-    return response
+    ) as span:
+        response = client.chat.completions.create(model=model, messages=messages, **kwargs)
+        set_model_result(
+            span,
+            response,
+            usage=get_nested(response, "usage"),
+            response_id=get_nested(response, "id"),
+        )
+        return response
 
 
 async def async_traced_openai_chat(
@@ -57,39 +38,23 @@ async def async_traced_openai_chat(
     *,
     model: str,
     messages: list[dict[str, Any]],
-    trace: Any | None = None,
+    trace: Trace | None = None,
     name: str = "openai.chat.completions.create",
     **kwargs: Any,
 ) -> Any:
-    """Async variant for ``AsyncOpenAI`` clients."""
-    active = trace or current_trace(required=True)
-    started = time.perf_counter()
-    try:
-        response = await client.chat.completions.create(model=model, messages=messages, **kwargs)
-    except Exception as exc:
-        record_model_span(
-            active,
-            provider="openai",
-            model=model,
-            name=name,
-            prompt=messages,
-            response=None,
-            started_at=started,
-            kwargs=kwargs,
-            error=exc,
-        )
-        raise
-
-    record_model_span(
-        active,
+    with model_span(
         provider="openai",
         model=model,
         name=name,
         prompt=messages,
-        response=response,
-        started_at=started,
-        usage=get_nested(response, "usage"),
+        trace=trace,
         kwargs=kwargs,
-        response_id=get_nested(response, "id"),
-    )
-    return response
+    ) as span:
+        response = await client.chat.completions.create(model=model, messages=messages, **kwargs)
+        set_model_result(
+            span,
+            response,
+            usage=get_nested(response, "usage"),
+            response_id=get_nested(response, "id"),
+        )
+        return response

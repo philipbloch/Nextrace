@@ -12,10 +12,6 @@ tool_gateway_port="${NEXTRACE_TOOL_GATEWAY_PORT:-8766}"
 tool_gateway_target="${NEXTRACE_TOOL_GATEWAY_TARGET:-https://tool-gateway.shopify.io/mcp}"
 import_interval="${NEXTRACE_IMPORT_INTERVAL:-300}"
 import_state_path="${NEXTRACE_IMPORT_STATE:-${HOME}/.nextrace/local-usage-import-state.json}"
-pricing_file="${NEXTRACE_PRICING_FILE:-}"
-if [[ -z "${pricing_file}" && -f "${repo_dir}/config/shopify-pricing.json" ]]; then
-  pricing_file="${repo_dir}/config/shopify-pricing.json"
-fi
 
 dashboard_label="com.philipbloch.nextrace-dashboard"
 http_proxy_label="com.philipbloch.nextrace-mcp-http-proxy"
@@ -23,147 +19,47 @@ importer_label="com.philipbloch.nextrace-local-usage-importer"
 
 mkdir -p "${launch_agents_dir}"
 
-write_dashboard_plist() {
-  local path="${launch_agents_dir}/${dashboard_label}.plist"
-  cat >"${path}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${dashboard_label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${python_bin}</string>
-    <string>-m</string>
-    <string>uvicorn</string>
-    <string>nextrace.dashboard.app:create_app</string>
-    <string>--factory</string>
-    <string>--host</string>
-    <string>127.0.0.1</string>
-    <string>--port</string>
-    <string>${dashboard_port}</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>${repo_dir}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NEXTRACE_DB</key>
-    <string>${db_path}</string>
-    <key>NEXTRACE_PRICING_FILE</key>
-    <string>${pricing_file}</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/nextrace-dashboard.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/nextrace-dashboard.err.log</string>
-</dict>
-</plist>
-EOF
-}
+"${python_bin}" - "${repo_dir}" "${launch_agents_dir}" "${db_path}" "${python_bin}" "${cli_bin}" \
+  "${dashboard_port}" "${tool_gateway_port}" "${tool_gateway_target}" "${import_interval}" "${import_state_path}" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
 
-write_http_proxy_plist() {
-  local path="${launch_agents_dir}/${http_proxy_label}.plist"
-  cat >"${path}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${http_proxy_label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${python_bin}</string>
-    <string>-m</string>
-    <string>nextrace.cli</string>
-    <string>mcp-http-proxy</string>
-    <string>--application</string>
-    <string>auto</string>
-    <string>--server</string>
-    <string>tool-gateway</string>
-    <string>--target</string>
-    <string>${tool_gateway_target}</string>
-    <string>--host</string>
-    <string>127.0.0.1</string>
-    <string>--port</string>
-    <string>${tool_gateway_port}</string>
-    <string>--db</string>
-    <string>${db_path}</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>${repo_dir}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NEXTRACE_DB</key>
-    <string>${db_path}</string>
-    <key>NEXTRACE_PRICING_FILE</key>
-    <string>${pricing_file}</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>/tmp/nextrace-mcp-http-proxy.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/nextrace-mcp-http-proxy.err.log</string>
-</dict>
-</plist>
-EOF
-}
+(repo, destination, database, python, cli, dashboard_port, proxy_port,
+ target, interval, import_state) = sys.argv[1:]
+interval = int(interval)
+if interval <= 0:
+    raise SystemExit("NEXTRACE_IMPORT_INTERVAL must be positive")
 
-write_importer_plist() {
-  local path="${launch_agents_dir}/${importer_label}.plist"
-  cat >"${path}" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${importer_label}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${cli_bin}</string>
-    <string>import-local-usage</string>
-    <string>--db</string>
-    <string>${db_path}</string>
-    <string>--state-path</string>
-    <string>${import_state_path}</string>
-  </array>
-  <key>WorkingDirectory</key>
-  <string>${repo_dir}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>NEXTRACE_DB</key>
-    <string>${db_path}</string>
-    <key>NEXTRACE_PRICING_FILE</key>
-    <string>${pricing_file}</string>
-    <key>PYTHONUNBUFFERED</key>
-    <string>1</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StartInterval</key>
-  <integer>${import_interval}</integer>
-  <key>StandardOutPath</key>
-  <string>/tmp/nextrace-local-usage-importer.out.log</string>
-  <key>StandardErrorPath</key>
-  <string>/tmp/nextrace-local-usage-importer.err.log</string>
-</dict>
-</plist>
-EOF
+base = {
+    "WorkingDirectory": repo,
+    "EnvironmentVariables": {"NEXTRACE_DB": database, "PYTHONUNBUFFERED": "1"},
+    "RunAtLoad": True,
 }
+jobs = {
+    "dashboard": {
+        "ProgramArguments": [python, "-m", "uvicorn", "nextrace.dashboard.app:create_app",
+                             "--factory", "--host", "127.0.0.1", "--port", dashboard_port],
+        "KeepAlive": True,
+    },
+    "mcp-http-proxy": {
+        "ProgramArguments": [python, "-m", "nextrace.cli", "mcp-http-proxy",
+                             "--application", "auto", "--server", "tool-gateway", "--target", target,
+                             "--host", "127.0.0.1", "--port", proxy_port, "--db", database],
+        "KeepAlive": True,
+    },
+    "local-usage-importer": {
+        "ProgramArguments": [cli, "import-local-usage", "--db", database, "--state-path", import_state],
+        "StartInterval": interval,
+    },
+}
+for name, options in jobs.items():
+    label = f"com.philipbloch.nextrace-{name}"
+    job = {**base, **options, "Label": label,
+           "StandardOutPath": f"/tmp/nextrace-{name}.out.log",
+           "StandardErrorPath": f"/tmp/nextrace-{name}.err.log"}
+    (Path(destination) / f"{label}.plist").write_bytes(plistlib.dumps(job, sort_keys=False))
+PY
 
 load_agent() {
   local label="$1"
@@ -182,13 +78,9 @@ load_agent() {
   launchctl kickstart -k "gui/${UID}/${label}"
 }
 
-write_dashboard_plist
-write_http_proxy_plist
-write_importer_plist
-
-load_agent "${dashboard_label}"
-load_agent "${http_proxy_label}"
-load_agent "${importer_label}"
+for label in "${dashboard_label}" "${http_proxy_label}" "${importer_label}"; do
+  load_agent "${label}"
+done
 
 cat <<EOF
 Installed Nextrace LaunchAgents:
@@ -197,5 +89,4 @@ Installed Nextrace LaunchAgents:
 - ${importer_label} -> every ${import_interval}s
 
 Database: ${db_path}
-Pricing file: ${pricing_file:-built-in public estimates}
 EOF

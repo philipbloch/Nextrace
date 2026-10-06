@@ -58,9 +58,6 @@ def test_import_codex_usage_records_redacted_model_span(tmp_path):
         store=store,
         application="se-assistant",
         files=[session_file],
-        input_cost_per_million=1.0,
-        cached_input_cost_per_million=0.1,
-        output_cost_per_million=2.0,
     )
 
     assert stats.imported == 1
@@ -74,7 +71,6 @@ def test_import_codex_usage_records_redacted_model_span(tmp_path):
     assert span["model"] == "gpt-test"
     assert span["input_tokens"] == 1000
     assert span["output_tokens"] == 50
-    assert span["cost_usd"] == 0.00101
     assert span["prompt"] == {"redacted": True, "source": "codex"}
     assert span["response"] == {"redacted": True, "source": "codex"}
 

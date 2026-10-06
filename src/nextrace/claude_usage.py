@@ -1,28 +1,24 @@
-"""Import local Claude Code usage into Nextrace traces."""
-
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from nextrace.pricing import default_pricing_registry
+from nextrace.agent_events import AgentRecording
 from nextrace.storage import SQLiteStore
-from nextrace.types import SpanRecord, TraceRecord
-
-
-@dataclass(frozen=True)
-class ClaudeUsageImportStats:
-    imported: int
-    files: int
+from nextrace.usage import UsageImportStats as ClaudeUsageImportStats
+from nextrace.usage import (
+    find_jsonl,
+    import_files,
+    int_or_none,
+    parse_timestamp,
+    read_jsonl,
+    stable_id,
+    string_or_none,
+    token_count,
+)
 
 
 def claude_project_slug(project_path: str | Path) -> str:
-    """Return Claude Code's on-disk project slug for an absolute path."""
     return "-" + str(Path(project_path).expanduser()).strip("/").replace("/", "-")
 
 
@@ -32,18 +28,10 @@ def find_claude_project_files(
     project_path: str | Path | None = None,
     latest: int | None = None,
 ) -> list[Path]:
-    """Find Claude Code JSONL transcript files."""
-    home = Path(claude_home).expanduser()
+    root = Path(claude_home).expanduser() / "projects"
     if project_path:
-        root = home / "projects" / claude_project_slug(project_path)
-        files = list(root.glob("*.jsonl")) if root.exists() else []
-    else:
-        root = home / "projects"
-        files = list(root.glob("*/*.jsonl")) if root.exists() else []
-    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    if latest:
-        files = files[:latest]
-    return files
+        root /= claude_project_slug(project_path)
+    return find_jsonl(root, "*.jsonl" if project_path else "*/*.jsonl", latest)
 
 
 def import_claude_usage(
@@ -53,195 +41,92 @@ def import_claude_usage(
     files: Iterable[str | Path],
     provider: str = "anthropic",
 ) -> ClaudeUsageImportStats:
-    """Import Claude Code assistant message usage as redacted model spans."""
-    imported = 0
-    file_count = 0
-    for file_path in [Path(path).expanduser() for path in files]:
-        file_count += 1
-        imported += _import_claude_file(
-            store=store,
-            application=application,
-            file_path=file_path,
-            provider=provider,
-        )
-    return ClaudeUsageImportStats(imported=imported, files=file_count)
+    return import_files(files, lambda path: _import_claude_file(store, application, path, provider))
 
 
 def _import_claude_file(
-    *,
-    store: SQLiteStore,
-    application: str,
-    file_path: Path,
-    provider: str,
+    store: SQLiteStore, application: str, file_path: Path, provider: str
 ) -> int:
-    imported = 0
-    with file_path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
+    recording = AgentRecording("claude-code", file_path.stem, application, str(file_path.resolve()))
+    event_turns: dict[str, str] = {}
+    for line_number, event in read_jsonl(file_path):
+        recording.session_id = str(
+            event.get("sessionId") or event.get("session_id") or recording.session_id
+        )
+        recording.cwd = string_or_none(event.get("cwd")) or recording.cwd
+        timestamp = parse_timestamp(event.get("timestamp"))
+        parent = event_turns.get(event.get("parentUuid"))
+        if parent:
+            recording.turn_id = parent
+        message = event.get("message")
+        if not isinstance(message, dict):
+            if event.get("type") == "system" and event.get("subtype") == "turn_duration":
+                recording.finish(timestamp)
+            continue
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        tool_results = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_result"]
+        if event.get("type") == "user" and not tool_results:
+            # Synthetic/meta user messages are context updates, not a new human turn.
+            if event.get("isMeta") or event.get("isCompactSummary"):
                 continue
-            if event.get("type") != "assistant":
-                continue
-            message = event.get("message")
-            if not isinstance(message, dict):
-                continue
-            model = _string_or_none(message.get("model"))
-            if not model or model == "<synthetic>":
-                continue
-            usage = message.get("usage")
-            if not isinstance(usage, dict):
-                continue
-            timestamp = _parse_timestamp(event.get("timestamp"))
-            if timestamp is None:
-                continue
-
-            session_id = str(event.get("sessionId") or event.get("session_id") or file_path.stem)
+            recording.begin(
+                str(
+                    event.get("uuid")
+                    or (f"started-{timestamp}" if timestamp is not None else "unattributed-user")
+                ),
+                timestamp,
+            )
+        event_id = event.get("uuid")
+        if event_id and recording.turn_id:
+            event_turns[event_id] = recording.turn_id
+        if timestamp is None:
+            continue
+        for result in tool_results:
+            if result.get("tool_use_id"):
+                recording.tool_result(
+                    str(result["tool_use_id"]), timestamp, result.get("is_error") is True
+                )
+        if event.get("type") != "assistant":
+            continue
+        model = string_or_none(message.get("model"))
+        usage = message.get("usage")
+        parent_span = None
+        if model and model != "<synthetic>" and isinstance(usage, dict):
             message_id = str(message.get("id") or event.get("uuid") or line_number)
-            trace_id = _stable_id("claude-trace", session_id, message_id, str(line_number))
-            span_id = _stable_id("claude-span", session_id, message_id, str(line_number))
-            input_tokens = _int_or_none(usage.get("input_tokens")) or 0
-            output_tokens = _int_or_none(usage.get("output_tokens")) or 0
-            cache_creation_tokens = _int_or_none(usage.get("cache_creation_input_tokens")) or 0
-            cache_read_tokens = _int_or_none(usage.get("cache_read_input_tokens")) or 0
-            cache_creation = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
-            cache_write_5m_tokens = _int_or_none(cache_creation.get("ephemeral_5m_input_tokens")) or 0
-            cache_write_1h_tokens = _int_or_none(cache_creation.get("ephemeral_1h_input_tokens")) or 0
-            unknown_cache_write_tokens = max(
-                cache_creation_tokens - cache_write_5m_tokens - cache_write_1h_tokens,
-                0,
-            )
-            total_tokens = input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
-            cost_usd = _estimate_claude_cost(
+            parent_span = stable_id("claude-model", recording.session_id, message_id)
+            input_tokens = token_count(usage.get("input_tokens"))
+            output_tokens = token_count(usage.get("output_tokens"))
+            cache_write = token_count(usage.get("cache_creation_input_tokens"))
+            cache_read = token_count(usage.get("cache_read_input_tokens"))
+            recording.model(
+                span_id=parent_span,
+                timestamp=timestamp,
+                provider=provider,
                 model=model,
-                input_tokens=input_tokens + cache_read_tokens,
+                input_tokens=input_tokens + cache_read + cache_write,
                 output_tokens=output_tokens,
-                cache_write_5m_tokens=cache_write_5m_tokens + unknown_cache_write_tokens,
-                cache_write_1h_tokens=cache_write_1h_tokens,
-                cache_read_tokens=cache_read_tokens,
-                effective_at=datetime.fromtimestamp(timestamp, timezone.utc).date(),
+                total_tokens=input_tokens + cache_read + cache_write + output_tokens,
+                metadata={
+                    "message_id": message_id,
+                    "request_id": string_or_none(event.get("requestId")),
+                    "cache_creation_input_tokens": cache_write,
+                    "cache_read_input_tokens": cache_read,
+                    "web_search_requests": _server_tool_count(usage, "web_search_requests"),
+                    "web_fetch_requests": _server_tool_count(usage, "web_fetch_requests"),
+                },
             )
-            metadata = {
-                "source": "claude-code",
-                "claude_session_id": session_id,
-                "claude_session_file": str(file_path),
-                "claude_line": line_number,
-                "claude_message_id": message_id,
-                "request_id": _string_or_none(event.get("requestId")),
-                "cwd": _string_or_none(event.get("cwd")),
-                "service_tier": _string_or_none(usage.get("service_tier")),
-                "speed": _string_or_none(usage.get("speed")),
-                "inference_geo": _string_or_none(usage.get("inference_geo")),
-                "cache_creation_input_tokens": cache_creation_tokens,
-                "cache_read_input_tokens": cache_read_tokens,
-                "cache_write_5m_input_tokens": cache_write_5m_tokens,
-                "cache_write_1h_input_tokens": cache_write_1h_tokens,
-                "cache_write_unknown_input_tokens": unknown_cache_write_tokens,
-                "web_search_requests": _server_tool_count(usage, "web_search_requests"),
-                "web_fetch_requests": _server_tool_count(usage, "web_fetch_requests"),
-                "cost_estimated": cost_usd is not None,
-            }
-            store.start_trace(
-                TraceRecord(
-                    id=trace_id,
-                    session_id=session_id,
-                    application=application,
-                    name=f"claude-code:model:{model}",
-                    user_id=None,
-                    started_at=timestamp,
-                    ended_at=timestamp,
-                    duration_ms=0.0,
-                    status="ok",
-                    error=None,
-                    tags=["claude-code", "model"],
-                    metadata={
-                        "source": "claude-code",
-                        "provider": provider,
-                        "model": model,
-                        "cost_estimated": cost_usd is not None,
-                    },
+        tool_uses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        for tool in tool_uses:
+            if tool.get("id"):
+                recording.tool(
+                    str(tool["id"]), str(tool.get("name") or "tool"), timestamp, parent_span
                 )
-            )
-            store.record_span(
-                SpanRecord(
-                    id=span_id,
-                    trace_id=trace_id,
-                    parent_id=None,
-                    kind="model",
-                    name=f"{provider}:{model}",
-                    provider=provider,
-                    model=model,
-                    started_at=timestamp,
-                    ended_at=timestamp,
-                    duration_ms=0.0,
-                    prompt={"redacted": True, "source": "claude-code"},
-                    response={"redacted": True, "source": "claude-code"},
-                    input_tokens=input_tokens + cache_creation_tokens + cache_read_tokens,
-                    output_tokens=output_tokens,
-                    total_tokens=total_tokens,
-                    cost_usd=cost_usd,
-                    retry_count=0,
-                    status="ok",
-                    error=None,
-                    metadata=metadata,
-                )
-            )
-            imported += 1
-    return imported
+        if message.get("stop_reason") in {"end_turn", "stop_sequence"}:
+            recording.finish(timestamp)
+    return recording.persist(store)
 
 
-def _estimate_claude_cost(
-    *,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-    cache_write_5m_tokens: int,
-    cache_write_1h_tokens: int,
-    cache_read_tokens: int,
-    effective_at: Any,
-) -> float | None:
-    return default_pricing_registry.estimate(
-        provider="anthropic",
-        model=model,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cached_input_tokens=cache_read_tokens,
-        cache_write_5m_tokens=cache_write_5m_tokens,
-        cache_write_1h_tokens=cache_write_1h_tokens,
-        effective_at=effective_at,
-    )
-
-
-def _server_tool_count(usage: dict[str, Any], key: str) -> int | None:
-    server_tool_use = usage.get("server_tool_use")
-    if not isinstance(server_tool_use, dict):
-        return None
-    return _int_or_none(server_tool_use.get(key))
-
-
-def _stable_id(*parts: str) -> str:
-    return hashlib.sha256(":".join(parts).encode("utf-8")).hexdigest()[:32]
-
-
-def _parse_timestamp(value: Any) -> float | None:
-    if not isinstance(value, str):
-        return None
-    normalized = value.removesuffix("Z") + "+00:00" if value.endswith("Z") else value
-    try:
-        return datetime.fromisoformat(normalized).timestamp()
-    except ValueError:
-        return None
-
-
-def _string_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _int_or_none(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    return None
+def _server_tool_count(usage, key):
+    value = usage.get("server_tool_use")
+    return int_or_none(value.get(key)) if isinstance(value, dict) else None

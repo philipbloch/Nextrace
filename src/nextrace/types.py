@@ -1,5 +1,3 @@
-"""Shared data records."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,6 +18,7 @@ class TraceRecord:
     duration_ms: float
     status: str
     error: str | None
+    turn_id: str | None = None
     tags: list[str] = field(default_factory=list)
     metadata: JsonDict = field(default_factory=dict)
 
@@ -41,9 +40,7 @@ class SpanRecord:
     input_tokens: int | None
     output_tokens: int | None
     total_tokens: int | None
-    cost_usd: float | None
     retry_count: int
     status: str
     error: str | None
     metadata: JsonDict = field(default_factory=dict)
-

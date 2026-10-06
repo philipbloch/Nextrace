@@ -86,7 +86,6 @@ def test_import_claude_usage_records_redacted_model_span(tmp_path):
     assert span["input_tokens"] == 1500
     assert span["output_tokens"] == 50
     assert span["total_tokens"] == 1550
-    assert span["cost_usd"] == 0.0047025
     assert span["prompt"] == {"redacted": True, "source": "claude-code"}
     assert span["response"] == {"redacted": True, "source": "claude-code"}
     assert span["metadata"]["cache_creation_input_tokens"] == 200

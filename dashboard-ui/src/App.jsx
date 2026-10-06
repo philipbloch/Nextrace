@@ -1,46 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import nextraceLogoUrl from "./assets/nextrace-logo.svg";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+import { dateInputValue, dateRangeWindow, localDateStart, presetDateRange } from "./dates.js";
+import { layoutWaterfall } from "./waterfall.js";
+import { errorDiagnosis, hasFailure } from "./diagnosis.js";
+
 const TRACE_LIMIT = 100;
-
-const usd = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
-
-function dateInputValue(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function localDateStart(value) {
-  if (!value) return null;
-  const [year, month, day] = value.split("-").map(Number);
-  if (!year || !month || !day) return null;
-  return new Date(year, month - 1, day);
-}
-
-function presetDateRange(preset) {
-  const today = new Date();
-  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-  if (preset === "yesterday") start.setDate(start.getDate() - 1);
-  const end = new Date(start);
-  return {
-    start: dateInputValue(start),
-    end: dateInputValue(end),
-  };
-}
-
-function fmtMoney(value) {
-  const n = Number(value || 0);
-  if (Math.abs(n) > 0 && Math.abs(n) < 0.01) return `$${n.toFixed(4)}`;
-  return usd.format(n);
-}
 
 function fmtMs(value) {
   const n = Number(value || 0);
@@ -57,30 +22,16 @@ function fmtTime(epoch) {
   return new Date(epoch * 1000).toLocaleString();
 }
 
-function spendView(summary) {
-  const costTotals = summary?.cost_totals || {};
-  const allCost =
-    costTotals.estimated_cost_usd ??
-    (summary?.cost_by_application || []).reduce((sum, row) => sum + Number(row.cost_usd || 0), 0);
-  const shopifyCost = Number(costTotals.shopify_proxy_cost_usd || 0);
-  const hasShopifyCost = shopifyCost > 0;
-  return {
-    cost: hasShopifyCost ? shopifyCost : Number(allCost || 0),
-    rows: hasShopifyCost ? summary?.shopify_cost_by_application || [] : summary?.cost_by_application || [],
-    label: hasShopifyCost ? "Shopify Cost" : "Estimated Cost",
-    note: hasShopifyCost ? "Proxy billing estimate" : "All tracked providers",
-    panelTitle: hasShopifyCost ? "Shopify Cost by Application" : "Cost by Application",
-    panelDescription: hasShopifyCost
-      ? "Shopify-proxy spend grouped by app."
-      : "Estimated spend grouped by app.",
-  };
-}
-
 function JsonBlock({ title, value }) {
   if (value === null || value === undefined || value === "") return null;
   return (
     <pre>
-      {title ? <strong>{title}{"\n"}</strong> : null}
+      {title ? (
+        <strong>
+          {title}
+          {"\n"}
+        </strong>
+      ) : null}
       {JSON.stringify(value, null, 2)}
     </pre>
   );
@@ -99,6 +50,8 @@ function Header({
   applications,
   selectedApplication,
   onApplicationChange,
+  selectedSession,
+  onSessionChange,
   rangeMode,
   rangeLabel,
   appliedStart,
@@ -156,6 +109,13 @@ function Header({
       </div>
 
       <div className="toolbar">
+        <input
+          type="search"
+          aria-label="Session filter"
+          placeholder="Filter by session ID"
+          value={selectedSession}
+          onChange={(event) => onSessionChange(event.target.value)}
+        />
         <select
           value={selectedApplication}
           onChange={(event) => onApplicationChange(event.target.value)}
@@ -200,7 +160,12 @@ function Header({
           </button>
 
           {open ? (
-            <div id="rangePopover" className="range-popover" role="dialog" aria-labelledby="rangePopoverTitle">
+            <div
+              id="rangePopover"
+              className="range-popover"
+              role="dialog"
+              aria-labelledby="rangePopoverTitle"
+            >
               <h2 id="rangePopoverTitle">Date range</h2>
               <div className="range-fields">
                 <label className="range-field">
@@ -253,22 +218,25 @@ function KpiCards({ summary, applicationCount }) {
   const failures = summary?.failure_rates || [];
   const total = failures.reduce((sum, row) => sum + Number(row.total || 0), 0);
   const failed = failures.reduce((sum, row) => sum + Number(row.failures || 0), 0);
-  const spend = spendView(summary);
 
   return (
     <section className="kpis" aria-label="Trace metrics">
       <div className="kpi">
         <div className="label">Traces</div>
         <div className="value">{summary?.totals?.traces || 0}</div>
+        <div className="kpi-note">
+          {summary?.totals?.running || 0} running · {summary?.totals?.interrupted || 0} interrupted
+        </div>
       </div>
       <div className="kpi kpi-failures">
         <div className="label">Failure Rate</div>
         <div className="value">{total ? fmtPct(failed / total) : "0%"}</div>
+        <div className="kpi-note">Completed runs only</div>
       </div>
-      <div className="kpi kpi-cost">
-        <div className="label">{spend.label}</div>
-        <div className="value">{fmtMoney(spend.cost)}</div>
-        <div className="kpi-note">{spend.note}</div>
+      <div className="kpi">
+        <div className="label">Sessions</div>
+        <div className="value">{summary?.totals?.sessions || 0}</div>
+        <div className="kpi-note">{summary?.totals?.spans || 0} recorded steps</div>
       </div>
       <div className="kpi kpi-apps">
         <div className="label">Applications</div>
@@ -291,10 +259,22 @@ function DashboardPanel({ title, description, actions, className = "", children 
   );
 }
 
+const statusLabels = {
+  all: "All",
+  running: "Running",
+  ok: "OK",
+  error: "Error",
+  interrupted: "Interrupted",
+};
+
+function StatusBadge({ status }) {
+  return <span className={`status-badge ${status}`}>{statusLabels[status] || status}</span>;
+}
+
 function TraceStatusFilter({ value, onChange }) {
   return (
     <div className="segmented" aria-label="Trace status filter">
-      {["all", "ok", "error"].map((status) => (
+      {Object.keys(statusLabels).map((status) => (
         <button
           key={status}
           className={`segment-button ${value === status ? "active" : ""}`}
@@ -302,7 +282,7 @@ function TraceStatusFilter({ value, onChange }) {
           aria-pressed={value === status}
           onClick={() => onChange(status)}
         >
-          {status === "all" ? "All" : status === "ok" ? "OK" : "Error"}
+          {statusLabels[status]}
         </button>
       ))}
     </div>
@@ -312,7 +292,7 @@ function TraceStatusFilter({ value, onChange }) {
 function TraceList({ traces, selectedTraceId, traceStatus, onSelect }) {
   if (!traces.length) {
     const label = traceStatus === "all" ? "" : `${traceStatus} `;
-    return <div className="empty">No {label}traces recorded.</div>;
+    return <div className="empty">No {label}traces match the current filters.</div>;
   }
 
   return traces.map((trace) => (
@@ -328,51 +308,124 @@ function TraceList({ traces, selectedTraceId, traceStatus, onSelect }) {
           <span>{trace.application}</span>
           <span>{fmtTime(trace.started_at)}</span>
           <span>{trace.span_count || 0} spans</span>
-          <span>{fmtMoney(trace.cost_usd)}</span>
         </div>
       </div>
-      <span className={trace.status === "error" ? "error" : "ok"}>{trace.status}</span>
+      <StatusBadge status={trace.status} />
     </button>
   ));
 }
 
 function TraceDetail({ trace }) {
+  const [collapsed, setCollapsed] = useState(new Set());
+  const [selectedSpanId, setSelectedSpanId] = useState(null);
+  const inspectionRef = useRef(null);
+  const scrollToInspection = useCallback(() => {
+    const section = inspectionRef.current;
+    const pane = section?.closest(".panel-body");
+    if (!pane) return;
+    pane.scrollBy({
+      top: section.getBoundingClientRect().top - pane.getBoundingClientRect().top - 8,
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+    });
+  }, []);
+  useEffect(() => {
+    setCollapsed(new Set());
+    setSelectedSpanId(null);
+  }, [trace?.id]);
+  useEffect(() => {
+    if (selectedSpanId) scrollToInspection();
+  }, [selectedSpanId, scrollToInspection]);
   if (!trace) return <div className="empty">Select a trace.</div>;
-  const spans = trace.spans || [];
-
+  const layout = layoutWaterfall(trace);
+  const selected = trace.spans?.find((span) => span.id === selectedSpanId);
+  const inspectSpan = (id) => {
+    setSelectedSpanId(id);
+    if (id === selectedSpanId) scrollToInspection();
+  };
+  const toggle = (id) =>
+    setCollapsed((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   return (
     <div>
-      <div className="timeline">
-        <TraceRunView trace={trace} />
-        {spans.length ? (
-          spans.map((span) => <SpanView key={span.id} span={span} />)
+      <TraceRunView trace={trace} />
+      <div className="execution-context">
+        {trace.turn_id ? <span>Turn {trace.turn_id}</span> : null}
+        <span>{trace.correlated_recordings || 0} correlated MCP recordings</span>
+        {trace.ended_at != null && trace.status !== "running" ? (
+          <a href={`/api/traces/${encodeURIComponent(trace.id)}/otel`} download>
+            Export OpenTelemetry
+          </a>
+        ) : null}
+      </div>
+      <ErrorDiagnosis record={hasFailure(selected) ? selected : trace} trace={trace} />
+      <div className="waterfall" aria-label="Nested timing waterfall">
+        <div className="waterfall-axis">
+          <span>Step</span>
+          <div>
+            <span>0</span>
+            <span>{fmtMs(layout.durationMs)}</span>
+          </div>
+        </div>
+        {layout.rows.length ? (
+          layout.rows
+            .filter((row) => !row.ancestors.some((id) => collapsed.has(id)))
+            .map((row) => (
+              <div
+                className={`waterfall-row ${selectedSpanId === row.span.id ? "selected" : ""}`}
+                key={row.span.id}
+              >
+                <div className="waterfall-label" style={{ paddingLeft: `${row.depth * 14}px` }}>
+                  {row.children ? (
+                    <button
+                      className="waterfall-toggle"
+                      onClick={() => toggle(row.span.id)}
+                      aria-label={`${collapsed.has(row.span.id) ? "Expand" : "Collapse"} ${row.span.name}`}
+                      aria-expanded={!collapsed.has(row.span.id)}
+                    >
+                      {collapsed.has(row.span.id) ? "▸" : "▾"}
+                    </button>
+                  ) : (
+                    <span className="waterfall-toggle" />
+                  )}
+                  <button
+                    className="waterfall-name"
+                    title={row.span.name}
+                    onClick={() => inspectSpan(row.span.id)}
+                  >
+                    {row.span.name}
+                  </button>
+                </div>
+                <button
+                  className="waterfall-track"
+                  onClick={() => inspectSpan(row.span.id)}
+                  aria-label={`Inspect ${row.span.name}: ${row.unknown ? "duration unavailable" : fmtMs(row.span.duration_ms)}`}
+                >
+                  <span
+                    className={`waterfall-bar status-${row.span.status} ${row.unknown || !row.width ? "point" : ""}`}
+                    style={{ left: `${row.offset}%`, width: `${row.width}%` }}
+                  />
+                  <span className="waterfall-duration">
+                    {row.unknown ? "Timing unavailable" : fmtMs(row.span.duration_ms)}
+                    {row.span.metadata?.timing === "log_interval" ? " · log interval" : ""}
+                  </span>
+                </button>
+              </div>
+            ))
         ) : (
           <div className="empty">No spans recorded for this trace.</div>
         )}
       </div>
-      {(trace.scores || []).length ? (
-        <>
-          <h2 className="detail-heading">Scores</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Value</th>
-                <th>Comment</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trace.scores.map((score) => (
-                <tr key={score.id}>
-                  <td>{score.name}</td>
-                  <td>{Number(score.value).toFixed(3)}</td>
-                  <td>{score.comment || ""}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      ) : null}
+      <section ref={inspectionRef} aria-label="Step inspection">
+        <p className="panel-note">
+          Select a step to inspect it. Dots mark events with no measured duration.
+        </p>
+        {selected ? <SpanView span={selected} /> : null}
+      </section>
+      {(trace.scores || []).length ? <JsonBlock title="Scores" value={trace.scores} /> : null}
     </div>
   );
 }
@@ -384,16 +437,26 @@ function TraceRunView({ trace }) {
         <div>
           <div className="timeline-step-label">Trace run</div>
           <div className="trace-title">{trace.name || trace.application}</div>
-          <div className="meta">
+          <div className="meta trace-identifiers">
             <span>trace {trace.id}</span>
             <span>session {trace.session_id}</span>
-            <span>{fmtMs(trace.duration_ms)}</span>
-            <span>{trace.spans?.length || 0} spans</span>
+          </div>
+          <div className="meta">
+            <span>
+              {trace.ended_at == null
+                ? trace.status === "running"
+                  ? "In progress"
+                  : "Completion time unavailable"
+                : fmtMs(trace.duration_ms)}
+            </span>
+            <span>
+              {trace.spans?.filter((span) => span.kind !== "observation").length || 0} recorded
+              steps
+            </span>
           </div>
         </div>
-        <span className={trace.status === "error" ? "error" : "ok"}>{trace.status}</span>
+        <StatusBadge status={trace.status} />
       </div>
-      {trace.error ? <pre>{trace.error}</pre> : null}
     </div>
   );
 }
@@ -409,18 +472,84 @@ function SpanView({ span }) {
           <div className="trace-title">{span.name}</div>
           <div className="meta">
             {label ? <span>{label}</span> : null}
-            <span>{fmtMs(span.duration_ms)}</span>
-            <span>{fmtMoney(span.cost_usd)}</span>
+            <span>
+              {span.metadata?.timing === "unknown" ? "Timing unavailable" : fmtMs(span.duration_ms)}
+            </span>
             {tokens ? <span>{tokens}</span> : null}
             {span.retry_count ? <span>{span.retry_count} retries</span> : null}
           </div>
         </div>
-        <span className={span.status === "error" ? "error" : "ok"}>{span.status}</span>
+        <StatusBadge status={span.status} />
       </div>
-      {span.error ? <pre>{span.error}</pre> : null}
       <JsonBlock title="Prompt/Input" value={span.prompt} />
       <JsonBlock title="Response/Output" value={span.response} />
     </div>
+  );
+}
+
+function ErrorDiagnosis({ record, trace }) {
+  const diagnosis = errorDiagnosis(record, trace);
+  if (!diagnosis) return null;
+  return (
+    <section className="error-diagnosis" aria-label="Error diagnosis">
+      <div className="span-head">
+        <div>
+          <h3>Error diagnosis</h3>
+          <div className="meta">{diagnosis.name}</div>
+        </div>
+        <div className="meta">
+          {diagnosis.httpStatus != null ? <span>HTTP {diagnosis.httpStatus}</span> : null}
+          {diagnosis.codes.map((code, index) => (
+            <span key={index}>Code {code}</span>
+          ))}
+          {diagnosis.exceptionType ? <span>{diagnosis.exceptionType}</span> : null}
+        </div>
+      </div>
+      <p>{diagnosis.explanation}</p>
+      {diagnosis.error && (diagnosis.missingMessage || diagnosis.hasMessage) ? (
+        <div className="meta diagnosis-failure">Recorded failure: {diagnosis.error}</div>
+      ) : null}
+      {diagnosis.details.map((item, index) => (
+        <div key={index}>
+          {diagnosis.details.length > 1 ? (
+            <h4>
+              Failed response {index + 1}
+              {item.code != null ? ` · Code ${item.code}` : ""}
+            </h4>
+          ) : null}
+          {item.message ? <pre aria-label="Original error message">{item.message}</pre> : null}
+          {item.message_truncated ? (
+            <p className="panel-note">Message exceeded the capture limit and was truncated.</p>
+          ) : null}
+        </div>
+      ))}
+      {!diagnosis.hasMessage && !diagnosis.missingMessage && diagnosis.error ? (
+        <pre aria-label="Original error message">{diagnosis.error}</pre>
+      ) : null}
+      {diagnosis.missingMessage ? (
+        <p className="panel-note">
+          The original error message was not captured for this recording. Check the original tool
+          response or upstream logs; Nextrace cannot reconstruct the cause.
+        </p>
+      ) : null}
+      {diagnosis.traceback ? (
+        <details className="diagnosis-traceback">
+          <summary>Exception traceback</summary>
+          <pre>{diagnosis.traceback}</pre>
+        </details>
+      ) : null}
+      <details className="diagnosis-identifiers">
+        <summary>Correlation IDs</summary>
+        <dl>
+          {diagnosis.identifiers.map(([label, value]) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{String(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+    </section>
   );
 }
 
@@ -438,7 +567,7 @@ function Bars({ rows, labelKey, valueKey, formatter, color }) {
         <div className="bar-track">
           <div className={`bar-fill ${color}`} style={{ width: `${width}%` }} />
         </div>
-        <div className="bar-value">{formatter(value)}</div>
+        <div className="bar-value">{formatter(value, row)}</div>
       </div>
     );
   });
@@ -446,12 +575,6 @@ function Bars({ rows, labelKey, valueKey, formatter, color }) {
 
 function SlowSteps({ rows }) {
   if (!rows.length) return <div className="empty">No span timings.</div>;
-  const sortedRows = [...rows].sort(
-    (a, b) =>
-      Number(b.avg_ms || 0) - Number(a.avg_ms || 0) ||
-      Number(b.max_ms || 0) - Number(a.max_ms || 0) ||
-      Number(b.count || 0) - Number(a.count || 0),
-  );
 
   return (
     <div className="table-wrap">
@@ -473,7 +596,7 @@ function SlowSteps({ rows }) {
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((row) => (
+          {rows.map((row) => (
             <tr key={`${row.kind}:${row.name}:${row.provider || ""}:${row.model || ""}`}>
               <td>{row.name}</td>
               <td>{row.kind}</td>
@@ -491,14 +614,7 @@ function SlowSteps({ rows }) {
 function ToolAccuracy({ rows }) {
   if (!rows.length) return <div className="empty">No tool calls.</div>;
   const hasQualityScore = (row) => row.accuracy != null;
-  const sortedRows = [...rows].sort(
-    (a, b) =>
-      Number(hasQualityScore(b)) - Number(hasQualityScore(a)) ||
-      Number(b.accuracy ?? -1) - Number(a.accuracy ?? -1) ||
-      Number(b.success_rate ?? -1) - Number(a.success_rate ?? -1) ||
-      Number(b.calls || 0) - Number(a.calls || 0),
-  );
-  const showQuality = sortedRows.some(hasQualityScore);
+  const showQuality = rows.some(hasQualityScore);
 
   return (
     <div className="table-wrap">
@@ -518,7 +634,7 @@ function ToolAccuracy({ rows }) {
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((row) => (
+          {rows.map((row) => (
             <tr key={row.name}>
               <td>{row.name}</td>
               <td>{row.calls}</td>
@@ -544,7 +660,6 @@ function ModelTable({ rows }) {
           <col />
           <col />
           <col />
-          <col />
         </colgroup>
         <thead>
           <tr>
@@ -552,7 +667,6 @@ function ModelTable({ rows }) {
             <th>Model</th>
             <th>Calls</th>
             <th>Latency</th>
-            <th>Cost</th>
             <th>Tokens</th>
           </tr>
         </thead>
@@ -562,8 +676,7 @@ function ModelTable({ rows }) {
               <td>{row.provider || "unknown"}</td>
               <td>{row.model || "unknown"}</td>
               <td>{row.calls}</td>
-              <td>{fmtMs(row.avg_latency_ms)}</td>
-              <td>{fmtMoney(row.cost_usd)}</td>
+              <td>{row.avg_latency_ms == null ? "Unavailable" : fmtMs(row.avg_latency_ms)}</td>
               <td>{Number(row.avg_tokens || 0).toFixed(0)}</td>
             </tr>
           ))}
@@ -593,112 +706,101 @@ function Connections({ rows }) {
   ));
 }
 
-async function fetchJson(url, signal) {
-  const response = await fetch(url, { signal });
-  if (!response.ok) throw new Error(`Request failed: ${response.status}`);
-  return response.json();
+function useJson(url, refreshToken = 0) {
+  const [state, setState] = useState({ url: null, data: null, loading: false, error: "" });
+  useEffect(() => {
+    if (!url) return;
+    const controller = new AbortController();
+    setState((current) => ({ ...current, url, loading: true, error: "" }));
+    fetch(url, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+        return response.json();
+      })
+      .then((data) => {
+        if (!controller.signal.aborted) setState({ url, data, loading: false, error: "" });
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted)
+          setState((current) => ({ ...current, loading: false, error: error.message }));
+      });
+    return () => controller.abort();
+  }, [url, refreshToken]);
+  return {
+    data: url ? state.data : null,
+    loading: Boolean(url) && (state.loading || state.url !== url),
+    error: state.url === url ? state.error : "",
+  };
+}
+
+function RequestContent({ loading, error, loadingLabel, onRetry, children }) {
+  if (loading)
+    return (
+      <div className="empty" role="status">
+        {loadingLabel}
+      </div>
+    );
+  if (error)
+    return (
+      <div className="empty" role="alert">
+        {error}
+        <button type="button" onClick={onRetry}>
+          Retry
+        </button>
+      </div>
+    );
+  return children;
 }
 
 export default function App() {
-  const [summary, setSummary] = useState(null);
-  const [appListSummary, setAppListSummary] = useState(null);
-  const [traces, setTraces] = useState([]);
   const [selectedTraceId, setSelectedTraceId] = useState(null);
-  const [selectedTrace, setSelectedTrace] = useState(null);
   const [application, setApplication] = useState("");
+  const [sessionId, setSessionId] = useState("");
   const [traceStatus, setTraceStatus] = useState("all");
   const [rangeMode, setRangeMode] = useState("today");
   const [appliedStart, setAppliedStart] = useState(() => dateInputValue(new Date()));
   const [appliedEnd, setAppliedEnd] = useState(() => dateInputValue(new Date()));
   const [refreshToken, setRefreshToken] = useState(0);
-  const [error, setError] = useState("");
 
-  const rangeWindow = useMemo(() => {
-    if (rangeMode === "today" || rangeMode === "yesterday") {
-      const presetRange = presetDateRange(rangeMode);
-      const start = localDateStart(presetRange.start);
-      const end = localDateStart(presetRange.end);
-      const until = end ? new Date(end.getTime() + DAY_MS) : null;
-      return {
-        since: start ? start.getTime() / 1000 : null,
-        until: until ? until.getTime() / 1000 : null,
-        label: `Showing ${rangeMode === "today" ? "Today" : "Yesterday"}`,
-      };
-    }
+  const rangeWindow = useMemo(
+    () => dateRangeWindow(rangeMode, appliedStart, appliedEnd),
+    [appliedStart, appliedEnd, rangeMode, refreshToken],
+  );
 
-    const start = localDateStart(appliedStart);
-    let end = localDateStart(appliedEnd);
-    if (start && end && end < start) end = start;
-    const until = end ? new Date(end.getTime() + DAY_MS) : null;
-    return {
-      since: start ? start.getTime() / 1000 : null,
-      until: until ? until.getTime() / 1000 : null,
-      label: `Showing ${start ? start.toLocaleDateString() : "Beginning"} to ${
-        end ? end.toLocaleDateString() : "Now"
-      }`,
-    };
-  }, [appliedEnd, appliedStart, rangeMode]);
+  const scopeQuery = useMemo(() => {
+    const params = new URLSearchParams();
+    if (application) params.set("application", application);
+    if (sessionId) params.set("session_id", sessionId);
+    if (rangeWindow.since != null) params.set("since", String(rangeWindow.since));
+    if (rangeWindow.until != null) params.set("until", String(rangeWindow.until));
+    return params.toString();
+  }, [application, sessionId, rangeWindow.since, rangeWindow.until]);
 
-  const applications = useMemo(() => {
-    const costApps = (appListSummary?.cost_by_application || []).map((row) => row.application);
-    const connectionApps = (appListSummary?.connections || []).map((row) => row.application);
-    return Array.from(new Set([...costApps, ...connectionApps])).filter(Boolean).sort();
-  }, [appListSummary]);
-
-  const spend = spendView(summary);
-
-  useEffect(() => {
-    const controller = new AbortController();
-
-    async function load() {
-      setError("");
-      const summaryParams = new URLSearchParams();
-      if (application) summaryParams.set("application", application);
-      if (rangeWindow.since != null) summaryParams.set("since", String(rangeWindow.since));
-      if (rangeWindow.until != null) summaryParams.set("until", String(rangeWindow.until));
-      const traceParams = new URLSearchParams(summaryParams);
-      if (traceStatus !== "all") traceParams.set("status", traceStatus);
-      traceParams.set("limit", String(TRACE_LIMIT));
-      const summaryUrl = summaryParams.toString() ? `/api/summary?${summaryParams}` : "/api/summary";
-      const traceUrl = traceParams.toString() ? `/api/traces?${traceParams}` : "/api/traces";
-      const [nextSummary, nextAppListSummary, nextTraces] = await Promise.all([
-        fetchJson(summaryUrl, controller.signal),
-        fetchJson("/api/summary", controller.signal),
-        fetchJson(traceUrl, controller.signal),
-      ]);
-      setSummary(nextSummary);
-      setAppListSummary(nextAppListSummary);
-      setTraces(nextTraces);
-      setSelectedTraceId((current) =>
-        nextTraces.some((trace) => trace.id === current) ? current : (nextTraces[0]?.id ?? null),
-      );
-    }
-
-    load().catch((loadError) => {
-      if (loadError.name !== "AbortError") setError(loadError.message);
-    });
-    return () => controller.abort();
-  }, [application, rangeWindow.since, rangeWindow.until, refreshToken, traceStatus]);
-
-  useEffect(() => {
-    if (!selectedTraceId) {
-      setSelectedTrace(null);
-      return;
-    }
-    const controller = new AbortController();
-    fetchJson(`/api/traces/${encodeURIComponent(selectedTraceId)}`, controller.signal)
-      .then(setSelectedTrace)
-      .catch((detailError) => {
-        if (detailError.name !== "AbortError") setError(detailError.message);
-      });
-    return () => controller.abort();
-  }, [selectedTraceId]);
+  const applicationRequest = useJson("/api/applications", refreshToken);
+  const summaryRequest = useJson(`/api/summary?${scopeQuery}`, refreshToken);
+  const traceParams = new URLSearchParams(scopeQuery);
+  if (traceStatus !== "all") traceParams.set("status", traceStatus);
+  traceParams.set("limit", String(TRACE_LIMIT));
+  const traceRequest = useJson(`/api/traces?${traceParams}`, refreshToken);
+  const applications = applicationRequest.data || [];
+  const traces = traceRequest.data || [];
+  const activeTraceId =
+    traceRequest.loading || traceRequest.error
+      ? null
+      : traces.some((trace) => trace.id === selectedTraceId)
+        ? selectedTraceId
+        : (traces[0]?.id ?? null);
+  const detailRequest = useJson(
+    activeTraceId ? `/api/traces/${encodeURIComponent(activeTraceId)}` : null,
+  );
+  const summary = summaryRequest.data;
+  const error = applicationRequest.error || summaryRequest.error;
+  const refresh = () => setRefreshToken((value) => value + 1);
 
   const applyRange = (start, end) => {
     setAppliedStart(start);
     setAppliedEnd(end);
     setRangeMode("custom");
-    setSelectedTraceId(null);
   };
 
   const applyPresetRange = (preset) => {
@@ -706,7 +808,6 @@ export default function App() {
     setAppliedStart(nextRange.start);
     setAppliedEnd(nextRange.end);
     setRangeMode(preset);
-    setSelectedTraceId(null);
   };
 
   return (
@@ -714,17 +815,16 @@ export default function App() {
       <Header
         applications={applications}
         selectedApplication={application}
-        onApplicationChange={(value) => {
-          setApplication(value);
-          setSelectedTraceId(null);
-        }}
+        selectedSession={sessionId}
+        onSessionChange={setSessionId}
+        onApplicationChange={setApplication}
         rangeMode={rangeMode}
         rangeLabel={rangeWindow.label}
-        appliedStart={appliedStart}
-        appliedEnd={appliedEnd}
+        appliedStart={rangeWindow.start}
+        appliedEnd={rangeWindow.end}
         onPresetRange={applyPresetRange}
         onApplyRange={applyRange}
-        onRefresh={() => setRefreshToken((value) => value + 1)}
+        onRefresh={refresh}
       />
 
       <main>
@@ -739,36 +839,52 @@ export default function App() {
           <div className="trace-workspace">
             <DashboardPanel
               title="Execution Traces"
-              description="Runs captured in the selected time range."
+              description="Agent turns and independent recordings in the selected time range."
               className="trace-list-panel"
-              actions={
-                <TraceStatusFilter
-                  value={traceStatus}
-                  onChange={(value) => {
-                    setTraceStatus(value);
-                    setSelectedTraceId(null);
-                  }}
-                />
-              }
+              actions={<TraceStatusFilter value={traceStatus} onChange={setTraceStatus} />}
             >
-              <div className="trace-list">
-                <TraceList
-                  traces={traces}
-                  selectedTraceId={selectedTraceId}
-                  traceStatus={traceStatus}
-                  onSelect={setSelectedTraceId}
-                />
+              {sessionId ? (
+                <div className="active-trace-filter">
+                  <span title={sessionId}>Session: {sessionId}</span>
+                  <button
+                    type="button"
+                    onClick={() => setSessionId("")}
+                    aria-label="Clear session filter"
+                  >
+                    Clear
+                  </button>
+                </div>
+              ) : null}
+              <div className="trace-list" aria-busy={traceRequest.loading}>
+                <RequestContent
+                  loading={traceRequest.loading}
+                  error={traceRequest.error}
+                  loadingLabel="Loading traces…"
+                  onRetry={refresh}
+                >
+                  <TraceList
+                    traces={traces}
+                    selectedTraceId={activeTraceId}
+                    traceStatus={traceStatus}
+                    onSelect={setSelectedTraceId}
+                  />
+                </RequestContent>
               </div>
             </DashboardPanel>
 
             <DashboardPanel
               title="Trace Detail"
-              description="Spans, prompts, outputs, and errors for the selected run."
+              description="Nested steps and timings for the selected session and turn."
               className="trace-detail-panel"
             >
-              <div className="trace-detail">
-                <TraceDetail trace={selectedTrace} />
-              </div>
+              <RequestContent
+                loading={traceRequest.loading || detailRequest.loading}
+                error={traceRequest.error || detailRequest.error}
+                loadingLabel="Loading trace…"
+                onRetry={refresh}
+              >
+                <TraceDetail trace={detailRequest.data} />
+              </RequestContent>
             </DashboardPanel>
           </div>
         </section>
@@ -776,28 +892,12 @@ export default function App() {
         <section className="dashboard-section" aria-label="Analysis">
           <div className="section-heading">
             <span>Analyze</span>
-            <h2>Spend and Reliability</h2>
+            <h2>Execution and Reliability</h2>
           </div>
           <div className="analysis-grid">
             <DashboardPanel
-              title={spend.panelTitle}
-              description={spend.panelDescription}
-              className="cost-panel"
-            >
-              <div className="bars">
-                <Bars
-                  rows={spend.rows}
-                  labelKey="application"
-                  valueKey="cost_usd"
-                  formatter={fmtMoney}
-                  color="green"
-                />
-              </div>
-            </DashboardPanel>
-
-            <DashboardPanel
               title="Failure Rates"
-              description="Error share by app for the selected range."
+              description="Errors among completed runs. Running and interrupted recordings are counted separately."
               className="failure-panel"
             >
               <div className="bars">
@@ -812,8 +912,8 @@ export default function App() {
             </DashboardPanel>
 
             <DashboardPanel
-              title="Prompt and Model Comparisons"
-              description="Provider, model, latency, cost, and token averages."
+              title="Models and Token Usage"
+              description="Provider, model, observed latency, and token averages."
               className="models-panel"
             >
               <ModelTable rows={summary?.prompt_model_comparisons || []} />

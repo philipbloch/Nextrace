@@ -1,15 +1,12 @@
 :root {
-  --shopify-green: #54d1f3;
-  --shopify-lime: #f553a8;
-  --shopify-gold: #54d1f3;
-  --shopify-forest: #0b2630;
+  --cyan: #54d1f3;
+  --pink: #f553a8;
   --ink: #f7f8f8;
   --ink-strong: #ffffff;
   --muted: #abb4b9;
   --muted-strong: #d9e5e8;
   --page: #050507;
   --panel: #111216;
-  --panel-soft: #0b0c10;
   --line: rgb(247 248 248 / 10%);
   --line-strong: rgb(84 209 243 / 40%);
   --shadow: 0 28px 90px rgb(84 209 243 / 17%);
@@ -34,11 +31,21 @@ body {
     radial-gradient(circle at 50% 0%, rgb(84 209 243 / 13%), transparent 34rem),
     radial-gradient(circle at 92% 8%, rgb(245 83 168 / 12%), transparent 26rem),
     linear-gradient(var(--line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--line) 1px, transparent 1px),
-    var(--page);
-  background-size: auto, auto, 34px 34px, 34px 34px, auto;
+    linear-gradient(90deg, var(--line) 1px, transparent 1px), var(--page);
+  background-size:
+    auto,
+    auto,
+    34px 34px,
+    34px 34px,
+    auto;
   font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
   line-height: 1.6;
 }
 
@@ -197,7 +204,7 @@ img {
 
 .eyebrow {
   margin: 0 0 16px;
-  color: var(--shopify-lime);
+  color: var(--pink);
   font-size: 0.78rem;
   font-weight: 850;
   letter-spacing: 0.16em;
@@ -242,7 +249,7 @@ h3 {
 
 .tagline {
   margin: 22px 0 0;
-  color: var(--shopify-lime);
+  color: var(--pink);
   font-size: clamp(1.24rem, 2vw, 1.65rem);
   font-weight: 760;
   text-wrap: balance;
@@ -250,7 +257,7 @@ h3 {
 
 .tagline-secondary {
   margin-top: 6px;
-  color: var(--shopify-green);
+  color: var(--cyan);
   font-size: clamp(1.02rem, 1.6vw, 1.3rem);
   font-weight: 760;
 }
@@ -284,8 +291,8 @@ h3 {
 
 .button.primary {
   color: #050507;
-  background: var(--shopify-lime);
-  border-color: var(--shopify-lime);
+  background: var(--pink);
+  border-color: var(--pink);
   box-shadow: 0 16px 40px rgb(245 83 168 / 23%);
 }
 
@@ -306,8 +313,7 @@ h3 {
   border-radius: 16px 16px 0 0;
   background:
     radial-gradient(circle at 16% 18%, rgb(84 209 243 / 14%), transparent 18rem),
-    radial-gradient(circle at 86% 14%, rgb(245 83 168 / 14%), transparent 18rem),
-    var(--panel);
+    radial-gradient(circle at 86% 14%, rgb(245 83 168 / 14%), transparent 18rem), var(--panel);
   box-shadow: var(--shadow);
   overflow: hidden;
 }
@@ -318,7 +324,10 @@ h3 {
     linear-gradient(var(--line) 1px, transparent 1px),
     linear-gradient(90deg, var(--line) 1px, transparent 1px),
     linear-gradient(112deg, rgb(5 5 7 / 92%), rgb(17 18 22 / 94%));
-  background-size: 34px 34px, 34px 34px, auto;
+  background-size:
+    34px 34px,
+    34px 34px,
+    auto;
 }
 
 .preview-chrome {
@@ -330,7 +339,11 @@ h3 {
   border-bottom: 1px solid var(--line);
   background: rgb(5 5 7 / 62%);
   color: var(--muted);
-  font: 0.76rem / 1.2 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font:
+    0.76rem / 1.2 "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
 }
 
 .chrome-dot {
@@ -340,11 +353,11 @@ h3 {
 }
 
 .chrome-dot.pink {
-  background: var(--shopify-lime);
+  background: var(--pink);
 }
 
 .chrome-dot.cyan {
-  background: var(--shopify-green);
+  background: var(--cyan);
 }
 
 .chrome-dot.white {
@@ -362,7 +375,7 @@ h3 {
 
 .chrome-live {
   margin-left: auto;
-  color: var(--shopify-green);
+  color: var(--cyan);
   font-weight: 800;
 }
 
@@ -386,9 +399,7 @@ h3 {
   gap: 18px;
   padding: 24px;
   border-right: 1px solid var(--line);
-  background:
-    linear-gradient(90deg, rgb(5 5 7 / 20%), rgb(5 5 7 / 72%)),
-    rgb(5 5 7 / 28%);
+  background: linear-gradient(90deg, rgb(5 5 7 / 20%), rgb(5 5 7 / 72%)), rgb(5 5 7 / 28%);
 }
 
 .preview-panel-head {
@@ -419,7 +430,11 @@ h3 {
 .terminal-feed {
   display: grid;
   gap: 10px;
-  font: 0.78rem / 1.45 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font:
+    0.78rem / 1.45 "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
 }
 
 .terminal-line {
@@ -434,7 +449,7 @@ h3 {
 }
 
 .terminal-line span {
-  color: var(--shopify-green);
+  color: var(--cyan);
 }
 
 .terminal-line p {
@@ -458,7 +473,7 @@ h3 {
   position: absolute;
   inset: 50% 16px auto;
   height: 1px;
-  background: linear-gradient(90deg, transparent, var(--shopify-green), var(--shopify-lime), transparent);
+  background: linear-gradient(90deg, transparent, var(--cyan), var(--pink), transparent);
 }
 
 .packet-rail span {
@@ -468,13 +483,13 @@ h3 {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: var(--shopify-green);
+  background: var(--cyan);
   box-shadow: 0 0 24px rgb(84 209 243 / 70%);
   animation: packetMove 3.2s linear infinite;
 }
 
 .packet-rail span:nth-child(2) {
-  background: var(--shopify-lime);
+  background: var(--pink);
   animation-delay: 0.85s;
   box-shadow: 0 0 24px rgb(245 83 168 / 70%);
 }
@@ -494,7 +509,12 @@ h3 {
   position: absolute;
   inset: 28px auto;
   width: 1px;
-  background: linear-gradient(transparent, rgb(84 209 243 / 55%), rgb(245 83 168 / 50%), transparent);
+  background: linear-gradient(
+    transparent,
+    rgb(84 209 243 / 55%),
+    rgb(245 83 168 / 50%),
+    transparent
+  );
 }
 
 .preview-connector span {
@@ -515,7 +535,7 @@ h3 {
   left: 10px;
   width: 14px;
   height: 2px;
-  background: var(--shopify-green);
+  background: var(--cyan);
   transform: translateY(-50%);
 }
 
@@ -532,8 +552,7 @@ h3 {
   align-content: start;
   padding: 22px;
   background:
-    linear-gradient(180deg, rgb(255 255 255 / 4%), transparent 180px),
-    rgb(14 15 19 / 88%);
+    linear-gradient(180deg, rgb(255 255 255 / 4%), transparent 180px), rgb(14 15 19 / 88%);
 }
 
 .preview-dashboard-top {
@@ -552,7 +571,7 @@ h3 {
   min-width: 76px;
   padding: 8px 11px;
   border-radius: 9px;
-  background: var(--shopify-green);
+  background: var(--cyan);
   color: #050507;
   font-size: 0.72rem;
   font-weight: 850;
@@ -588,11 +607,11 @@ h3 {
 }
 
 .pink-text {
-  color: var(--shopify-lime) !important;
+  color: var(--pink) !important;
 }
 
 .cyan-text {
-  color: var(--shopify-green) !important;
+  color: var(--cyan) !important;
 }
 
 .preview-workspace {
@@ -631,7 +650,7 @@ h3 {
 }
 
 .trace-filter.active {
-  background: var(--shopify-green);
+  background: var(--cyan);
   color: #050507;
 }
 
@@ -670,12 +689,12 @@ h3 {
   width: 9px;
   height: 9px;
   border-radius: 999px;
-  background: var(--shopify-green);
+  background: var(--cyan);
   box-shadow: 0 0 18px rgb(84 209 243 / 55%);
 }
 
 .preview-trace-row.error .trace-pip {
-  background: var(--shopify-lime);
+  background: var(--pink);
   box-shadow: 0 0 18px rgb(245 83 168 / 55%);
 }
 
@@ -708,7 +727,7 @@ h3 {
   padding: 5px 7px;
   border-radius: 7px;
   background: rgb(84 209 243 / 13%);
-  color: var(--shopify-green);
+  color: var(--cyan);
   font-size: 0.68rem;
   font-style: normal;
   font-weight: 850;
@@ -719,7 +738,7 @@ h3 {
 .preview-trace-row.error em,
 .detail-status.error {
   background: rgb(245 83 168 / 16%);
-  color: var(--shopify-lime);
+  color: var(--pink);
 }
 
 .trace-detail-preview {
@@ -771,7 +790,7 @@ h3 {
   width: var(--fill);
   height: 10px;
   border-radius: 999px;
-  background: var(--shopify-green);
+  background: var(--cyan);
   animation: chartPulse 3.8s ease-in-out infinite;
 }
 
@@ -781,7 +800,7 @@ h3 {
 }
 
 .pink-chart i {
-  background: var(--shopify-lime);
+  background: var(--pink);
 }
 
 @keyframes terminalLine {
@@ -914,7 +933,7 @@ h3 {
   width: 44px;
   height: 44px;
   color: #050507;
-  background: var(--shopify-lime);
+  background: var(--pink);
   border-radius: 10px;
   font-weight: 850;
 }
@@ -992,7 +1011,7 @@ h3 {
 .section-icon {
   width: 44px;
   height: 44px;
-  color: var(--shopify-green);
+  color: var(--cyan);
   fill: none;
   stroke: currentColor;
   stroke-linecap: round;
@@ -1024,9 +1043,7 @@ h3 {
   width: min(960px, 100%);
   border: 1px solid var(--line-strong);
   border-radius: 12px;
-  background:
-    linear-gradient(180deg, rgb(84 209 243 / 7%), transparent 88px),
-    #06070a;
+  background: linear-gradient(180deg, rgb(84 209 243 / 7%), transparent 88px), #06070a;
   box-shadow: 0 24px 70px rgb(84 209 243 / 17%);
   overflow: hidden;
 }
@@ -1103,8 +1120,12 @@ h3 {
 }
 
 .prompt {
-  color: var(--shopify-lime);
-  font: 0.92rem / 1 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  color: var(--pink);
+  font:
+    0.92rem / 1 "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
   font-weight: 850;
 }
 
@@ -1113,7 +1134,11 @@ h3 {
   flex: 1;
   overflow-x: auto;
   color: #e4faff;
-  font: 0.88rem / 1.5 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font:
+    0.88rem / 1.5 "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
   scrollbar-width: none;
   white-space: nowrap;
 }
@@ -1160,7 +1185,7 @@ h3 {
   width: 42px;
   height: 42px;
   border-radius: 10px;
-  background: var(--shopify-lime);
+  background: var(--pink);
   color: #050507;
   font-weight: 850;
 }
@@ -1194,9 +1219,7 @@ h3 {
   padding: 20px;
   border: 1px solid var(--line-strong);
   border-radius: 12px;
-  background:
-    linear-gradient(180deg, rgb(84 209 243 / 7%), transparent 170px),
-    rgb(5 5 7 / 56%);
+  background: linear-gradient(180deg, rgb(84 209 243 / 7%), transparent 170px), rgb(5 5 7 / 56%);
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 4%);
 }
 
@@ -1266,7 +1289,11 @@ pre {
   padding: 24px;
   overflow-x: auto;
   color: #e4faff;
-  font: 0.92rem / 1.7 "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font:
+    0.92rem / 1.7 "SFMono-Regular",
+    Consolas,
+    "Liberation Mono",
+    monospace;
 }
 
 code {

@@ -1,5 +1,3 @@
-"""FastAPI dashboard for local AI traces."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +12,6 @@ ASSETS_DIR = STATIC_DIR / "assets"
 
 
 def create_app(db_path: str | Path | None = None) -> Any:
-    """Create the dashboard ASGI app."""
     try:
         from fastapi import FastAPI, HTTPException, Query
         from fastapi.responses import FileResponse, HTMLResponse
@@ -56,29 +53,56 @@ def create_app(db_path: str | Path | None = None) -> Any:
     @app.get("/api/summary")
     def summary(
         application: str | None = None,
+        session_id: str | None = None,
         since: float | None = Query(default=None, ge=0),
         until: float | None = Query(default=None, ge=0),
     ) -> dict[str, Any]:
-        return store.summary(application=application, since=since, until=until)
+        return store.summary(
+            application=application, session_id=session_id, since=since, until=until
+        )
 
     @app.get("/api/connections")
     def connections() -> list[dict[str, Any]]:
         return store.list_connections()
 
+    @app.get("/api/applications")
+    def applications() -> list[str]:
+        return store.list_applications()
+
     @app.get("/api/traces")
     def traces(
         limit: int = Query(default=100, ge=1, le=500),
         application: str | None = None,
-        status: str | None = Query(default=None, pattern="^(ok|error)$"),
+        session_id: str | None = None,
+        status: str | None = Query(default=None, pattern="^(running|ok|error|interrupted)$"),
         since: float | None = Query(default=None, ge=0),
         until: float | None = Query(default=None, ge=0),
     ) -> list[dict[str, Any]]:
         return store.list_traces(
             limit=limit,
             application=application,
+            session_id=session_id,
             status=status,
             since=since,
             until=until,
+        )
+
+    @app.get("/api/traces/{trace_id}/otel")
+    def trace_export(trace_id: str):
+        from fastapi.responses import JSONResponse
+
+        from nextrace.otel import export_traces
+
+        trace = store.get_trace(trace_id)
+        if trace is None:
+            raise HTTPException(status_code=404, detail="Trace not found")
+        if trace["ended_at"] is None or trace["status"] == "running":
+            raise HTTPException(
+                status_code=409, detail="This recording has no observed completion time"
+            )
+        return JSONResponse(
+            export_traces([trace]),
+            headers={"Content-Disposition": 'attachment; filename="nextrace-trace.otel.json"'},
         )
 
     @app.get("/api/traces/{trace_id}")

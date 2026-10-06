@@ -14,4 +14,6 @@ build/
 *.db-wal
 *.sqlite
 *.sqlite3
+.nextrace-owners/
 .env
+.codex/config.toml

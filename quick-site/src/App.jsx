@@ -3,7 +3,7 @@ import nextraceLogoUrl from "./assets/nextrace-logo.svg";
 
 const metrics = [
   ["OK / Error", "Execution trace filters"],
-  ["Cost", "By project and model"],
+  ["Waterfall", "Nested execution timing"],
   ["Redaction", "MCP-safe capture"],
   ["Local logs", "Codex, Claude Code, Pi, and more"],
 ];
@@ -11,7 +11,7 @@ const metrics = [
 const flowSteps = [
   "AI coding agents connect through local usage adapters or MCP.",
   "Nextrace proxies stdio MCPs and tool-gateway HTTP traffic.",
-  "Dashboard groups traces, cost, latency, and status by application.",
+  "Dashboard groups model and tool events into sessions and turns.",
 ];
 
 const signals = [
@@ -20,24 +20,21 @@ const signals = [
     "Filter successful and failed runs, inspect steps, and spot slow tool calls.",
   ],
   [
-    "Cost by application",
-    "See which projects drive model spend across Codex, Claude Code, Pi, and MCP usage.",
+    "Sessions and turns",
+    "Follow model and tool calls within each agent turn, with nested timings and OpenTelemetry export.",
   ],
   [
-    "Prompt and model comparison",
-    "Compare providers, models, token volume, latency, and estimated cost side by side.",
+    "Models and token usage",
+    "Compare providers, models, token volume and observed latency side by side.",
   ],
-  [
-    "Connected sources",
-    "Verify active imports and MCP proxies before chasing missing data.",
-  ],
+  ["Connected sources", "Verify active imports and MCP proxies before chasing missing data."],
 ];
 
 const previewTerminalLines = [
   ["nextrace@local", "codex-import --latest 1"],
   ["trace", "codex:model:gpt-5.5 captured"],
   ["span", "shopify-proxy/gpt-5.5 redacted"],
-  ["cost", "$0.12 estimated"],
+  ["turn", "model and tool events correlated"],
   ["mcp", "tool-gateway initialize returned HTTP 401"],
   ["dashboard", "summary refreshed on port 8765"],
 ];
@@ -46,15 +43,13 @@ const previewTraces = [
   {
     name: "codex:model:gpt-5.5",
     app: "se-assistant",
-    cost: "$0.12",
     status: "ok",
-    duration: "0.0ms",
+    duration: "Unavailable",
     tokens: "92,806",
   },
   {
     name: "mcp:tool-gateway:initialize",
     app: "nextrace",
-    cost: "$0.00",
     status: "error",
     duration: "618.4ms",
     tokens: "0",
@@ -62,9 +57,8 @@ const previewTraces = [
   {
     name: "codex:model:gpt-5.5",
     app: "nextrace",
-    cost: "$0.38",
     status: "ok",
-    duration: "0.0ms",
+    duration: "Unavailable",
     tokens: "188,412",
   },
 ];
@@ -219,12 +213,12 @@ function Hero() {
         <TraceIcon />
         <p className="eyebrow">AI workflow tracing</p>
         <h1>Trace the intelligence.</h1>
-        <p className="tagline">See every step your AI takes.</p>
+        <p className="tagline">Follow your AI execution.</p>
         <p className="tagline tagline-secondary">Trace deeper. Build smarter.</p>
         <p className="lede">
-          Nextrace follows Codex, Claude Code, Pi, other AI agents, MCP tools, local usage,
-          and model cost from execution to outcome. Sensitive payloads stay out. Every AI
-          workflow becomes visible enough to trace, measure, and improve.
+          Nextrace follows Codex, Claude Code, Pi, other AI agents, MCP tools, local usage, and
+          token usage from execution to outcome. MCP and local usage imports capture redacted
+          metadata; Python integrations record the payloads you supply.
         </p>
         <div className="hero-actions" aria-label="Primary actions">
           <a className="button primary" href="#run">
@@ -243,15 +237,17 @@ function Hero() {
 
 function ProductPreview() {
   const [activeTrace, setActiveTrace] = useState(0);
+  const [filter, setFilter] = useState("all");
   const trace = previewTraces[activeTrace];
 
   useEffect(() => {
+    if (filter !== "all") return;
     const id = window.setInterval(() => {
       setActiveTrace((current) => (current + 1) % previewTraces.length);
     }, 3200);
 
     return () => window.clearInterval(id);
-  }, []);
+  }, [filter]);
 
   return (
     <figure className="product-visual" aria-label="Animated Nextrace dashboard preview">
@@ -274,7 +270,11 @@ function ProductPreview() {
             </div>
             <div className="terminal-feed">
               {previewTerminalLines.map(([label, body], index) => (
-                <div className="terminal-line" key={`${label}:${body}`} style={{ "--delay": `${index * 0.36}s` }}>
+                <div
+                  className="terminal-line"
+                  key={`${label}:${body}`}
+                  style={{ "--delay": `${index * 0.36}s` }}
+                >
                   <span>{label}</span>
                   <p>{body}</p>
                 </div>
@@ -310,8 +310,8 @@ function ProductPreview() {
                 <strong className="pink-text">3.2%</strong>
               </div>
               <div>
-                <span>Cost</span>
-                <strong className="cyan-text">$27.93</strong>
+                <span>Sessions</span>
+                <strong className="cyan-text">24</strong>
               </div>
             </div>
 
@@ -322,34 +322,46 @@ function ProductPreview() {
                   <strong>Execution Traces</strong>
                 </div>
                 <div className="trace-filter-row" aria-label="Trace filters">
-                  <button type="button" className="trace-filter active">
-                    All
-                  </button>
-                  <button type="button" className="trace-filter">
-                    OK
-                  </button>
-                  <button type="button" className="trace-filter">
-                    Error
-                  </button>
-                </div>
-                <div className="preview-trace-list">
-                  {previewTraces.map((row, index) => (
+                  {["all", "ok", "error"].map((status) => (
                     <button
-                      className={`preview-trace-row ${activeTrace === index ? "active" : ""} ${row.status}`}
-                      key={`${row.name}:${row.app}`}
                       type="button"
-                      onClick={() => setActiveTrace(index)}
+                      key={status}
+                      className={`trace-filter ${filter === status ? "active" : ""}`}
+                      aria-pressed={filter === status}
+                      onClick={() => {
+                        setFilter(status);
+                        setActiveTrace(
+                          previewTraces.findIndex(
+                            (row) => status === "all" || row.status === status,
+                          ),
+                        );
+                      }}
                     >
-                      <span className="trace-pip" />
-                      <span>
-                        <strong>{row.name}</strong>
-                        <small>
-                          {row.app} / {row.duration} / {row.cost}
-                        </small>
-                      </span>
-                      <em>{row.status}</em>
+                      {status === "all" ? "All" : status === "ok" ? "OK" : "Error"}
                     </button>
                   ))}
+                </div>
+                <div className="preview-trace-list">
+                  {previewTraces.map(
+                    (row, index) =>
+                      (filter === "all" || row.status === filter) && (
+                        <button
+                          className={`preview-trace-row ${activeTrace === index ? "active" : ""} ${row.status}`}
+                          key={`${row.name}:${row.app}`}
+                          type="button"
+                          onClick={() => setActiveTrace(index)}
+                        >
+                          <span className="trace-pip" />
+                          <span>
+                            <strong>{row.name}</strong>
+                            <small>
+                              {row.app} / {row.duration}
+                            </small>
+                          </span>
+                          <em>{row.status}</em>
+                        </button>
+                      ),
+                  )}
                 </div>
               </section>
 
@@ -381,9 +393,9 @@ function ProductPreview() {
               </section>
             </div>
 
-            <div className="preview-insights" aria-label="Spend and reliability">
+            <div className="preview-insights" aria-label="Timing and reliability">
               <div className="mini-chart">
-                <span>Cost by application</span>
+                <span>Execution timing</span>
                 <i style={{ "--fill": "88%" }} />
                 <i style={{ "--fill": "34%" }} />
               </div>
@@ -421,8 +433,9 @@ function ConnectSection() {
         <p className="eyebrow">The harness</p>
         <h2>No new system of record. Just one operating lens.</h2>
         <p>
-          Nextrace sits beside the tools engineers already use. It observes the execution path,
-          records durable metadata, and leaves prompts, auth headers, and raw tool output behind.
+          Nextrace sits beside the tools engineers already use. It observes the execution path and
+          records durable metadata. MCP proxies redact credentials in failure messages and omit
+          successful tool output. Usage importers omit prompts and responses.
         </p>
       </div>
       <div className="flow-list" aria-label="Connection flow">
@@ -461,7 +474,8 @@ function RunSection() {
   const [copyState, setCopyState] = useState("idle");
   const mounted = useRef(true);
   const resetTimer = useRef(null);
-  const copyLabel = copyState === "copied" ? "Copied" : copyState === "failed" ? "Try again" : "Copy";
+  const copyLabel =
+    copyState === "copied" ? "Copied" : copyState === "failed" ? "Try again" : "Copy";
 
   useEffect(() => {
     mounted.current = true;
@@ -494,7 +508,7 @@ function RunSection() {
         <h2>Install once. Let the agents report back.</h2>
         <p>
           Clone Nextrace, install the dashboard extra, and register the local services that keep
-          usage, traces, cost, and MCP activity flowing into the dashboard.
+          sessions, traces, tokens, and MCP activity flowing into the dashboard.
         </p>
       </div>
 

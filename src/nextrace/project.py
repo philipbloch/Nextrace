@@ -1,5 +1,3 @@
-"""Project/application resolution helpers."""
-
 from __future__ import annotations
 
 import json
@@ -8,6 +6,8 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+
+from nextrace.files import write_json_atomic
 
 try:
     import tomllib
@@ -27,9 +27,12 @@ def default_project_state_path() -> Path:
 
 def application_from_project_path(project_path: str | Path) -> str:
     path = Path(project_path).expanduser()
-    name = _project_name_from_pyproject(path) or path.name or path.resolve().name or "unknown-project"
+    name = (
+        _project_name_from_pyproject(path) or path.name or path.resolve().name or "unknown-project"
+    )
     normalized = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-._").lower()
     return normalized or "unknown-project"
+
 
 def _project_name_from_pyproject(project_path: Path) -> str | None:
     pyproject_path = (
@@ -98,8 +101,7 @@ def write_current_project(
         "source": source,
         "updated_at": time.time(),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_atomic(path, data)
     return data
 
 

@@ -6,6 +6,45 @@ from nextrace import SQLiteStore
 from nextrace.usage_importer import import_local_usage
 
 
+def test_import_does_not_mark_concurrent_appends_as_read(tmp_path, monkeypatch):
+    import nextrace.usage_importer as importer
+
+    home = tmp_path / ".claude"
+    session = home / "projects" / "app" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    event = {
+        "type": "assistant",
+        "cwd": str(tmp_path / "app"),
+        "sessionId": "session",
+        "timestamp": "2026-10-05T00:00:00Z",
+        "message": {"id": "first", "model": "test", "usage": {"input_tokens": 10}},
+    }
+    session.write_text(json.dumps(event) + "\n")
+    original_import = importer.import_claude_usage
+
+    def append_during_import(**kwargs):
+        stats = original_import(**kwargs)
+        event["message"]["id"] = "second"
+        with session.open("a") as file:
+            file.write(json.dumps(event) + "\n")
+        return stats
+
+    store = SQLiteStore(tmp_path / "traces.db")
+    options = {
+        "store": store,
+        "claude_home": home,
+        "source": "claude",
+        "state_path": tmp_path / "state.json",
+    }
+    with monkeypatch.context() as patch:
+        patch.setattr(importer, "import_claude_usage", append_during_import)
+        assert import_local_usage(**options).claude_records == 1
+    assert import_local_usage(**options).claude_records == 2
+    assert import_local_usage(**options).claude_records == 0
+    assert len(store.list_traces()) == 1
+    assert store.list_traces()[0]["span_count"] == 2
+
+
 def test_import_local_usage_groups_projects_and_tracks_state(tmp_path):
     codex_home = tmp_path / ".codex"
     claude_home = tmp_path / ".claude"
